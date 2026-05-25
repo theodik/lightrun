@@ -1,0 +1,108 @@
+# docker-compose.example.yml
+#
+# Starting point. Adapt names, domains, and middleware to your stack.
+# The three load-bearing ideas:
+#
+#   1. Lightrun shares a volume with whatever container builds the binaries it
+#      runs, so it can exec them by path.
+#   2. Each gateway (LIGHTRUN_GATEWAY_<NAME>_*) gets its own Traefik router, so
+#      middleware (auth, IP allowlist, rate limit) is applied per gateway. Add
+#      a new gateway → add a new env trio + a new router → no lightrun code
+#      change.
+#   3. The MCP port (LIGHTRUN_MCP_PORT) is DELIBERATELY not behind any Traefik
+#      router. It's only reachable from containers on the internal network.
+#      Anything that can reach it can spawn arbitrary processes — treat it
+#      like an SSH socket, not a public API.
+
+services:
+  lightrun:
+    build: .
+    # image: ghcr.io/<you>/lightrun:latest
+    restart: unless-stopped
+    volumes:
+      # Shared with the container that produces the binaries. Read-only from
+      # lightrun's perspective is fine — it only needs exec, not write.
+      - workspace-home:/workspace:ro
+    environment:
+      LIGHTRUN_MCP_PORT: "18082"
+      LIGHTRUN_LOG_BUFFER_SIZE: "1000"
+      LIGHTRUN_STOPPED_TTL: "1h"
+
+      # One gateway per Traefik router. PORT is the listener inside this
+      # container. URL is the template returned to MCP callers (use %s for
+      # the subdomain — Go's fmt.Sprintf placeholder).
+      LIGHTRUN_GATEWAY_AUTH_PORT: "18080"
+      LIGHTRUN_GATEWAY_AUTH_URL: "https://%s.app.example.com"
+      LIGHTRUN_GATEWAY_AUTH_DESCRIPTION: "Behind forward-auth — for trusted humans"
+
+      LIGHTRUN_GATEWAY_PUBLIC_PORT: "18081"
+      LIGHTRUN_GATEWAY_PUBLIC_URL: "https://%s.pub.example.com"
+      LIGHTRUN_GATEWAY_PUBLIC_DESCRIPTION: "Public, no auth"
+    networks:
+      - internal   # workspace → lightrun MCP
+      - traefik    # Traefik → lightrun gateway ports
+    labels:
+      traefik.enable: "true"
+
+      # --- AUTH gateway (port 18080) ---
+      # Wildcard subdomain on *.app.example.com; forward-auth middleware in
+      # front. Adapt the rule and middleware to your setup. Syntax shown is
+      # Traefik v3 (pure regex); for v2 use {sub:[a-z0-9-]+} named captures.
+      traefik.http.routers.lightrun-auth.rule: "HostRegexp(`^[a-z0-9-]+\\.app\\.example\\.com$`)"
+      traefik.http.routers.lightrun-auth.entrypoints: "websecure"
+      traefik.http.routers.lightrun-auth.tls.certresolver: "letsencrypt"
+      traefik.http.routers.lightrun-auth.service: "lightrun-auth"
+      traefik.http.routers.lightrun-auth.middlewares: "forward-auth@docker"
+      traefik.http.services.lightrun-auth.loadbalancer.server.port: "18080"
+
+      # --- PUBLIC gateway (port 18081) ---
+      traefik.http.routers.lightrun-public.rule: "HostRegexp(`^[a-z0-9-]+\\.pub\\.example\\.com$`)"
+      traefik.http.routers.lightrun-public.entrypoints: "websecure"
+      traefik.http.routers.lightrun-public.tls.certresolver: "letsencrypt"
+      traefik.http.routers.lightrun-public.service: "lightrun-public"
+      traefik.http.services.lightrun-public.loadbalancer.server.port: "18081"
+
+      # --- MCP (port 18082) ---
+      # Intentionally no router. Reachable only via the `internal` network.
+
+  # Placeholder for whatever produces binaries on the shared volume and calls
+  # lightrun's MCP at http://lightrun:18082/mcp. Replace with your real image.
+  workspace:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    volumes:
+      - workspace-home:/workspace
+    networks:
+      - internal
+
+  # Your existing Traefik instance — shown here only to anchor the network.
+  # Remove this block if you already have Traefik elsewhere; just make sure
+  # it sits on the `traefik` network so it can see lightrun's labels.
+  traefik:
+    image: traefik:v3
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.websecure.address=:443"
+      # ... TLS / certresolver config goes here
+    ports:
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - traefik
+
+volumes:
+  workspace-home:
+
+networks:
+  internal:
+    # internal=true blocks containers on this network from reaching the
+    # outside internet. Keep it ON if your spawned apps don't need outbound
+    # access (and you want the strongest guarantee that MCP can't be reached
+    # from anywhere unexpected). Turn it OFF if apps need to fetch deps or
+    # call external APIs.
+    internal: true
+  traefik:
+    # If you already have a Traefik network, declare it external:
+    # external: true

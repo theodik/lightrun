@@ -1,0 +1,4 @@
+/lightrun
+*.test
+coverage.out
+coverage.html

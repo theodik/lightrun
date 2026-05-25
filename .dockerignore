@@ -1,0 +1,10 @@
+.git
+.gitignore
+.github
+README.md
+LICENSE
+coverage.*
+*.test
+docker-compose*.yml
+Dockerfile
+.dockerignore

@@ -126,7 +126,7 @@ func freePort(t *testing.T) int {
 
 func TestStart_HappyPath(t *testing.T) {
 	bin := writeTestBin(t, "#!/bin/sh\necho \"started on $PORT\"\nsleep 30\n")
-	m := New(20, 0)
+	m := New(20, 0, "")
 	t.Cleanup(func() { stopAll(t, m) })
 
 	port := freePort(t)
@@ -156,7 +156,7 @@ func TestStart_HappyPath(t *testing.T) {
 
 func TestStart_LooksUpBySubdomain(t *testing.T) {
 	bin := writeTestBin(t, "#!/bin/sh\nsleep 30\n")
-	m := New(10, 0)
+	m := New(10, 0, "")
 	t.Cleanup(func() { stopAll(t, m) })
 
 	p, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "beta", Port: freePort(t), Gateway: "g"})
@@ -170,7 +170,7 @@ func TestStart_LooksUpBySubdomain(t *testing.T) {
 }
 
 func TestStart_ValidationErrors(t *testing.T) {
-	m := New(10, 0)
+	m := New(10, 0, "")
 	t.Cleanup(func() { stopAll(t, m) })
 
 	t.Run("bad subdomain", func(t *testing.T) {
@@ -202,8 +202,47 @@ func TestStart_ValidationErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := m.Start(StartOptions{BinaryPath: path, Subdomain: "ok2", Port: freePort(t), Gateway: "g"})
-		if err == nil || !strings.Contains(err.Error(), "not executable") {
-			t.Errorf("got %v, want not-executable error", err)
+		if err == nil || !strings.Contains(err.Error(), "no executable bit") {
+			t.Errorf("got %v, want no-executable-bit error", err)
+		}
+	})
+
+	t.Run("binary path is a directory", func(t *testing.T) {
+		dir := t.TempDir()
+		_, err := m.Start(StartOptions{BinaryPath: dir, Subdomain: "dir", Port: freePort(t), Gateway: "g"})
+		if err == nil || !strings.Contains(err.Error(), "is a directory") {
+			t.Errorf("got %v, want is-a-directory error", err)
+		}
+	})
+
+	t.Run("permission denied on stat", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("root bypasses dir permissions, can't exercise EACCES via stat")
+		}
+		dir := t.TempDir()
+		path := filepath.Join(dir, "hidden")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// 0o000 on the parent dir makes stat of children return EACCES.
+		if err := os.Chmod(dir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+		_, err := m.Start(StartOptions{BinaryPath: path, Subdomain: "perm", Port: freePort(t), Gateway: "g"})
+		if err == nil || !strings.Contains(err.Error(), "permission denied") {
+			t.Errorf("got %v, want permission-denied error", err)
+		}
+	})
+
+	t.Run("bad shebang interpreter", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "badshebang")
+		if err := os.WriteFile(path, []byte("#!/no/such/interpreter\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_, err := m.Start(StartOptions{BinaryPath: path, Subdomain: "shebang", Port: freePort(t), Gateway: "g"})
+		if err == nil || !strings.Contains(err.Error(), "interpreter not found") {
+			t.Errorf("got %v, want shebang-interpreter error", err)
 		}
 	})
 
@@ -247,9 +286,143 @@ func TestStart_ValidationErrors(t *testing.T) {
 	})
 }
 
+func TestStart_DefaultsWorkingDirToBinaryDir(t *testing.T) {
+	// Drop a binary that reports its own CWD; default WorkingDir should be the
+	// directory containing the binary, so the printed line should match it.
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "pwdbin.sh")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\npwd\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := New(20, 0, "")
+	t.Cleanup(func() { stopAll(t, m) })
+
+	p, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "cwd", Port: freePort(t), Gateway: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.WorkingDir != dir {
+		t.Errorf("WorkingDir = %q, want %q", p.WorkingDir, dir)
+	}
+
+	// macOS /tmp may be a symlink to /private/tmp, so resolve before matching.
+	wantResolved, _ := filepath.EvalSymlinks(dir)
+	waitFor(t, 2*time.Second, func() bool {
+		for _, line := range p.Tail(10) {
+			if line == dir || line == wantResolved {
+				return true
+			}
+		}
+		return false
+	}, "child never logged the expected CWD")
+}
+
+func TestStart_ExplicitWorkingDirIsUsed(t *testing.T) {
+	binDir := t.TempDir()
+	bin := filepath.Join(binDir, "pwdbin.sh")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\npwd\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir() // separate from binDir to prove the override is used
+	m := New(20, 0, "")
+	t.Cleanup(func() { stopAll(t, m) })
+
+	p, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "ecwd", Port: freePort(t), Gateway: "g", WorkingDir: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.WorkingDir != cwd {
+		t.Errorf("WorkingDir = %q, want %q", p.WorkingDir, cwd)
+	}
+	wantResolved, _ := filepath.EvalSymlinks(cwd)
+	waitFor(t, 2*time.Second, func() bool {
+		for _, line := range p.Tail(10) {
+			if line == cwd || line == wantResolved {
+				return true
+			}
+		}
+		return false
+	}, "child never logged the overridden CWD")
+}
+
+func TestStart_WorkingDirValidation(t *testing.T) {
+	m := New(20, 0, "")
+	t.Cleanup(func() { stopAll(t, m) })
+	bin := writeTestBin(t, "#!/bin/sh\nsleep 1\n")
+
+	t.Run("not found", func(t *testing.T) {
+		_, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "wd1", Port: freePort(t), Gateway: "g", WorkingDir: "/nonexistent/dir"})
+		if err == nil || !strings.Contains(err.Error(), "working_dir not found") {
+			t.Errorf("got %v, want working_dir-not-found error", err)
+		}
+	})
+
+	t.Run("not a directory", func(t *testing.T) {
+		_, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "wd2", Port: freePort(t), Gateway: "g", WorkingDir: bin})
+		if err == nil || !strings.Contains(err.Error(), "is not a directory") {
+			t.Errorf("got %v, want not-a-directory error", err)
+		}
+	})
+}
+
+func TestStart_ExpandsHomePrefix(t *testing.T) {
+	// Write the binary inside a temp dir and treat that dir as the base. A
+	// "~/<name>" path should resolve to it and start successfully; the stored
+	// BinaryPath should be the expanded absolute path so logs / status are
+	// debuggable.
+	base := t.TempDir()
+	path := filepath.Join(base, "tinybin.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(10, 0, base)
+	t.Cleanup(func() { stopAll(t, m) })
+
+	p, err := m.Start(StartOptions{BinaryPath: "~/tinybin.sh", Subdomain: "hp", Port: freePort(t), Gateway: "g"})
+	if err != nil {
+		t.Fatalf("start with ~ prefix failed: %v", err)
+	}
+	if p.BinaryPath != path {
+		t.Errorf("BinaryPath = %q, want expanded %q", p.BinaryPath, path)
+	}
+}
+
+func TestStart_TildeWithoutBaseLeftLiteral(t *testing.T) {
+	// base == "" disables expansion: a literal "~/..." should fail the
+	// not-found check rather than getting silently rewritten.
+	m := New(10, 0, "")
+	t.Cleanup(func() { stopAll(t, m) })
+
+	_, err := m.Start(StartOptions{BinaryPath: "~/nope", Subdomain: "lit", Port: freePort(t), Gateway: "g"})
+	if err == nil || !strings.Contains(err.Error(), "binary not found") {
+		t.Errorf("got %v, want binary-not-found (no expansion when base is empty)", err)
+	}
+}
+
+func TestExpandBinaryPath(t *testing.T) {
+	cases := []struct {
+		in, base, want string
+	}{
+		{"~", "/h", "/h"},
+		{"~/foo", "/h", "/h/foo"},
+		{"~/a/b", "/h", "/h/a/b"},
+		{"~foo", "/h", "~foo"},       // ~user form: unsupported, passthrough
+		{"/abs/path", "/h", "/abs/path"}, // absolute: untouched
+		{"rel/path", "/h", "rel/path"},   // relative: untouched
+		{"~/foo", "", "~/foo"},           // empty base: disabled
+		{"", "/h", ""},                   // empty path: passthrough
+	}
+	for _, c := range cases {
+		if got := expandBinaryPath(c.in, c.base); got != c.want {
+			t.Errorf("expandBinaryPath(%q, %q) = %q, want %q", c.in, c.base, got, c.want)
+		}
+	}
+}
+
 func TestStop_FlipsStatusAndFreesPort(t *testing.T) {
 	bin := writeTestBin(t, "#!/bin/sh\nsleep 30\n")
-	m := New(10, 0)
+	m := New(10, 0, "")
 	t.Cleanup(func() { stopAll(t, m) })
 
 	port := freePort(t)
@@ -276,7 +449,7 @@ func TestHealth_UnhealthyWhenProcessDoesNotBind(t *testing.T) {
 	// Manager's fields *before* Start is race-safe (the `go` statement
 	// establishes a happens-before to the probe goroutine).
 	bin := writeTestBin(t, "#!/bin/sh\nsleep 30\n")
-	m := New(10, 0)
+	m := New(10, 0, "")
 	m.probeTimeout = 400 * time.Millisecond
 	m.probeInterval = 50 * time.Millisecond
 	t.Cleanup(func() { stopAll(t, m) })
@@ -296,7 +469,7 @@ func TestHealth_UnhealthyWhenProcessDoesNotBind(t *testing.T) {
 
 func TestProcessNaturalExitFlipsStatus(t *testing.T) {
 	bin := writeTestBin(t, "#!/bin/sh\nexit 0\n")
-	m := New(10, 0)
+	m := New(10, 0, "")
 	t.Cleanup(func() { stopAll(t, m) })
 
 	p, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "exit", Port: freePort(t), Gateway: "g"})
@@ -315,7 +488,7 @@ func TestProcessNaturalExitFlipsStatus(t *testing.T) {
 func TestJanitor_SweepsStoppedAfterTTL(t *testing.T) {
 	bin := writeTestBin(t, "#!/bin/sh\nexit 0\n")
 	ttl := 50 * time.Millisecond
-	m := New(10, ttl) // ttl > 0 also spawns the janitor goroutine
+	m := New(10, ttl, "") // ttl > 0 also spawns the janitor goroutine
 	t.Cleanup(func() { stopAll(t, m) })
 
 	p, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "gone", Port: freePort(t), Gateway: "g"})
@@ -338,7 +511,7 @@ func TestJanitor_SweepsStoppedAfterTTL(t *testing.T) {
 
 func TestJanitor_KeepsStoppedWhenTTLZero(t *testing.T) {
 	bin := writeTestBin(t, "#!/bin/sh\nexit 0\n")
-	m := New(10, 0) // ttl=0: janitor disabled, entries kept forever
+	m := New(10, 0, "") // ttl=0: janitor disabled, entries kept forever; "" disables ~ expansion
 	t.Cleanup(func() { stopAll(t, m) })
 
 	p, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "keep", Port: freePort(t), Gateway: "g"})
@@ -358,7 +531,7 @@ func TestJanitor_KeepsStoppedWhenTTLZero(t *testing.T) {
 
 func TestRestart_NewIDSameSubdomainAndPort(t *testing.T) {
 	bin := writeTestBin(t, "#!/bin/sh\nsleep 30\n")
-	m := New(10, 0)
+	m := New(10, 0, "")
 	t.Cleanup(func() { stopAll(t, m) })
 
 	port := freePort(t)
@@ -392,7 +565,7 @@ func TestRestart_NewIDSameSubdomainAndPort(t *testing.T) {
 }
 
 func TestRestart_NotFound(t *testing.T) {
-	m := New(10, 0)
+	m := New(10, 0, "")
 	t.Cleanup(func() { stopAll(t, m) })
 	_, err := m.Restart("nonexistent")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
@@ -402,7 +575,7 @@ func TestRestart_NotFound(t *testing.T) {
 
 func TestStopAll(t *testing.T) {
 	bin := writeTestBin(t, "#!/bin/sh\nsleep 30\n")
-	m := New(10, 0)
+	m := New(10, 0, "")
 
 	for i := 0; i < 3; i++ {
 		_, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: fmt.Sprintf("s%d", i), Port: freePort(t), Gateway: "g"})

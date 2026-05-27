@@ -51,6 +51,33 @@ func TestParseGateways_UnderscoreInName(t *testing.T) {
 	}
 }
 
+func TestLoad_BinaryBaseDir(t *testing.T) {
+	t.Setenv("LIGHTRUN_BINARY_BASE_DIR", "/srv/builds")
+	t.Setenv("LIGHTRUN_GATEWAY_X_PORT", "18083")
+	t.Setenv("LIGHTRUN_GATEWAY_X_URL", "https://%s.example.com")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BinaryBaseDir != "/srv/builds" {
+		t.Errorf("BinaryBaseDir = %q, want /srv/builds", cfg.BinaryBaseDir)
+	}
+}
+
+func TestLoad_BinaryBaseDirDefaultsToHome(t *testing.T) {
+	t.Setenv("LIGHTRUN_BINARY_BASE_DIR", "")
+	t.Setenv("HOME", "/fake/home")
+	t.Setenv("LIGHTRUN_GATEWAY_X_PORT", "18084")
+	t.Setenv("LIGHTRUN_GATEWAY_X_URL", "https://%s.example.com")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BinaryBaseDir != "/fake/home" {
+		t.Errorf("BinaryBaseDir = %q, want /fake/home", cfg.BinaryBaseDir)
+	}
+}
+
 func TestLoad_MCPPortGatewayConflict(t *testing.T) {
 	t.Setenv("LIGHTRUN_MCP_PORT", "18080")
 	t.Setenv("LIGHTRUN_GATEWAY_X_PORT", "18080")

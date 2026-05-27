@@ -26,7 +26,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	mgr := manager.New(cfg.LogBufferSize, cfg.StoppedTTL)
+	mgr := manager.New(cfg.LogBufferSize, cfg.StoppedTTL, cfg.BinaryBaseDir)
 	mcpServer := mcp.New(mgr, cfg.Gateways, logger.With("component", "mcp"))
 
 	// signalCtx cancels on SIGINT/SIGTERM. errgroup derives a child ctx that

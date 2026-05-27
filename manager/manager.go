@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -72,6 +73,7 @@ const (
 type Process struct {
 	ID         string
 	BinaryPath string
+	WorkingDir string
 	Subdomain  string
 	Port       int
 	Gateway    string
@@ -117,6 +119,11 @@ type StartOptions struct {
 	Port       int
 	Env        map[string]string
 	Gateway    string
+	// WorkingDir is the directory the child process is launched in. Empty
+	// means "use the directory containing BinaryPath" — most apps expect to
+	// run from next to their own assets (web/, tmp/, ...), so that default
+	// matches typical run.sh behaviour.
+	WorkingDir string
 }
 
 type Manager struct {
@@ -129,6 +136,7 @@ type Manager struct {
 	stoppedTTL    time.Duration
 	probeTimeout  time.Duration
 	probeInterval time.Duration
+	binaryBaseDir string // empty disables '~' expansion
 }
 
 // janitorInterval is the period at which the background sweeper checks for
@@ -139,7 +147,9 @@ var janitorInterval = 1 * time.Minute
 // New creates a Manager and, if stoppedTTL > 0, spawns a background janitor
 // that drops stopped Process entries older than stoppedTTL. Set stoppedTTL = 0
 // to keep stopped entries forever (useful in tests / short-lived runs).
-func New(logSize int, stoppedTTL time.Duration) *Manager {
+// binaryBaseDir is the directory used to resolve a leading '~' (or '~/...') in
+// StartOptions.BinaryPath; pass "" to disable that expansion.
+func New(logSize int, stoppedTTL time.Duration, binaryBaseDir string) *Manager {
 	m := &Manager{
 		procs:         make(map[string]*Process),
 		bySubdomain:   make(map[string]*Process),
@@ -148,6 +158,7 @@ func New(logSize int, stoppedTTL time.Duration) *Manager {
 		stoppedTTL:    stoppedTTL,
 		probeTimeout:  defaultProbeTimeout,
 		probeInterval: defaultProbeInterval,
+		binaryBaseDir: binaryBaseDir,
 	}
 	if stoppedTTL > 0 {
 		go m.runJanitor()
@@ -194,12 +205,17 @@ func (m *Manager) Start(opts StartOptions) (*Process, error) {
 	if opts.Port <= 0 || opts.Port > 65535 {
 		return nil, fmt.Errorf("invalid port %d", opts.Port)
 	}
-	info, err := os.Stat(opts.BinaryPath)
-	if err != nil {
-		return nil, fmt.Errorf("binary not found: %w", err)
+	opts.BinaryPath = expandBinaryPath(opts.BinaryPath, m.binaryBaseDir)
+	if err := checkBinary(opts.BinaryPath); err != nil {
+		return nil, err
 	}
-	if info.IsDir() || info.Mode()&0o111 == 0 {
-		return nil, fmt.Errorf("binary not executable: %s", opts.BinaryPath)
+	if opts.WorkingDir == "" {
+		opts.WorkingDir = filepath.Dir(opts.BinaryPath)
+	} else {
+		opts.WorkingDir = expandBinaryPath(opts.WorkingDir, m.binaryBaseDir)
+		if err := checkWorkingDir(opts.WorkingDir); err != nil {
+			return nil, err
+		}
 	}
 
 	m.mu.Lock()
@@ -224,6 +240,7 @@ func (m *Manager) Start(opts StartOptions) (*Process, error) {
 	p := &Process{
 		ID:         id,
 		BinaryPath: opts.BinaryPath,
+		WorkingDir: opts.WorkingDir,
 		Subdomain:  opts.Subdomain,
 		Port:       opts.Port,
 		Gateway:    opts.Gateway,
@@ -235,6 +252,7 @@ func (m *Manager) Start(opts StartOptions) (*Process, error) {
 	}
 
 	cmd := exec.Command(opts.BinaryPath)
+	cmd.Dir = opts.WorkingDir
 	cmd.Env = buildChildEnv(opts.Port, opts.Env)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid:   true,
@@ -254,7 +272,7 @@ func (m *Manager) Start(opts StartOptions) (*Process, error) {
 
 	if err := cmd.Start(); err != nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("start: %w", err)
+		return nil, classifyExecError(err, opts.BinaryPath)
 	}
 	p.cmd = cmd
 
@@ -451,6 +469,86 @@ func (m *Manager) StopAll(ctx context.Context) {
 	case <-doneCh:
 	case <-ctx.Done():
 	}
+}
+
+// checkBinary distinguishes "not found", "is a directory", "permission denied
+// on stat" and "no executable bit set" so the start tool can tell the caller
+// *why* their binary was rejected without a follow-up exec attempt. Exec-time
+// failures (wrong arch, missing shebang interpreter, noexec mount) are handled
+// separately by classifyExecError after cmd.Start.
+func checkBinary(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return fmt.Errorf("binary not found: %s", path)
+		case errors.Is(err, os.ErrPermission):
+			return fmt.Errorf("permission denied reading binary %s (lightrun uid=%d)", path, os.Getuid())
+		}
+		return fmt.Errorf("stat binary %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("binary path is a directory: %s", path)
+	}
+	if info.Mode()&0o111 == 0 {
+		return fmt.Errorf("binary is not executable: no executable bit on %s (mode %v)", path, info.Mode().Perm())
+	}
+	return nil
+}
+
+// checkWorkingDir mirrors checkBinary's error granularity for an explicit
+// working_dir override: callers want to know whether their path was missing,
+// inaccessible, or just a regular file before they get a generic exec failure.
+func checkWorkingDir(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return fmt.Errorf("working_dir not found: %s", path)
+		case errors.Is(err, os.ErrPermission):
+			return fmt.Errorf("permission denied reading working_dir %s (lightrun uid=%d)", path, os.Getuid())
+		}
+		return fmt.Errorf("stat working_dir %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("working_dir is not a directory: %s", path)
+	}
+	return nil
+}
+
+// classifyExecError unwraps the os.PathError that exec.Cmd.Start returns when
+// the kernel rejects the exec, mapping the underlying errno to a message that
+// names a likely cause. Falls back to a generic wrap when the errno isn't one
+// we recognise.
+func classifyExecError(err error, path string) error {
+	var perr *os.PathError
+	if errors.As(err, &perr) {
+		switch {
+		case errors.Is(perr.Err, syscall.ENOENT):
+			return fmt.Errorf("exec failed for %s: file or shebang interpreter not found", path)
+		case errors.Is(perr.Err, syscall.ENOEXEC):
+			return fmt.Errorf("exec failed for %s: bad binary format (wrong architecture or not an executable)", path)
+		case errors.Is(perr.Err, syscall.EACCES):
+			return fmt.Errorf("exec failed for %s: permission denied (filesystem may be mounted noexec, or file lacks exec for uid=%d)", path, os.Getuid())
+		}
+	}
+	return fmt.Errorf("start %s: %w", path, err)
+}
+
+// expandBinaryPath resolves a leading '~' (alone) or '~/...' against base.
+// base == "" disables expansion (path returned verbatim). '~user/...' style
+// per-user lookups are not supported and are returned unchanged.
+func expandBinaryPath(path, base string) string {
+	if base == "" || path == "" || path[0] != '~' {
+		return path
+	}
+	if path == "~" {
+		return base
+	}
+	if strings.HasPrefix(path, "~/") {
+		return filepath.Join(base, path[2:])
+	}
+	return path
 }
 
 func portFree(port int) bool {

@@ -26,7 +26,7 @@ func newTestServer(t *testing.T) *Server {
 		{Name: "g1", Port: 19090, URL: "https://%s.g1.example.com", Description: "first"},
 		{Name: "g2", Port: 19091, URL: "https://%s.g2.example.com"},
 	}
-	mgr := manager.New(20, 0)
+	mgr := manager.New(20, 0, "")
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

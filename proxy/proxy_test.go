@@ -55,7 +55,7 @@ func writeSleepBin(t *testing.T) string {
 
 func newTestManager(t *testing.T) *manager.Manager {
 	t.Helper()
-	m := manager.New(10, 0)
+	m := manager.New(10, 0, "")
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

@@ -116,7 +116,7 @@ func (s *Server) registerTools() {
 			mcpgo.WithDescription(s.startToolDescription()),
 			mcpgo.WithString("binary_path",
 				mcpgo.Required(),
-				mcpgo.Description("Absolute path to the executable to launch."),
+				mcpgo.Description("Path to the executable to launch. Absolute paths are used as-is. A leading '~' (or '~/...') is expanded against lightrun's configured binary base dir (LIGHTRUN_BINARY_BASE_DIR, defaults to lightrun's $HOME) — use this so callers don't need to know lightrun's absolute layout."),
 			),
 			mcpgo.WithString("subdomain",
 				mcpgo.Required(),
@@ -133,6 +133,9 @@ func (s *Server) registerTools() {
 			),
 			mcpgo.WithObject("env",
 				mcpgo.Description("Optional map of additional environment variables (string -> string)."),
+			),
+			mcpgo.WithString("working_dir",
+				mcpgo.Description("Optional working directory for the child process. Defaults to the directory containing binary_path — match this to whatever 'cd' the app's run script would do, since most apps resolve sibling paths (web/, tmp/, ./db) relative to CWD. Same '~' expansion as binary_path."),
 			),
 		),
 		s.handleStart,
@@ -182,6 +185,7 @@ func (s *Server) registerTools() {
 type processView struct {
 	ID         string   `json:"id"`
 	BinaryPath string   `json:"binary_path"`
+	WorkingDir string   `json:"working_dir"`
 	Subdomain  string   `json:"subdomain"`
 	URL        string   `json:"url"`
 	Port       int      `json:"port"`
@@ -202,6 +206,7 @@ func (s *Server) view(p *manager.Process, includeLogs int) processView {
 	v := processView{
 		ID:         p.ID,
 		BinaryPath: p.BinaryPath,
+		WorkingDir: p.WorkingDir,
 		Subdomain:  p.Subdomain,
 		URL:        url,
 		Port:       p.Port,
@@ -227,6 +232,7 @@ func (s *Server) handleStart(_ context.Context, req mcpgo.CallToolRequest) (*mcp
 	binaryPath, _ := args["binary_path"].(string)
 	subdomain, _ := args["subdomain"].(string)
 	gateway, _ := args["gateway"].(string)
+	workingDir, _ := args["working_dir"].(string)
 
 	portRaw, ok := args["port"]
 	if !ok {
@@ -265,6 +271,7 @@ func (s *Server) handleStart(_ context.Context, req mcpgo.CallToolRequest) (*mcp
 		Port:       port,
 		Env:        env,
 		Gateway:    gateway,
+		WorkingDir: workingDir,
 	})
 	if err != nil {
 		return mcpgo.NewToolResultError(err.Error()), nil

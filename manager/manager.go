@@ -427,6 +427,21 @@ func (m *Manager) Get(id string) (*Process, bool) {
 	return p, ok
 }
 
+// SubdomainsInUse returns a map of subdomain → process ID for every subdomain
+// currently bound to a running process. reap drops the binding on exit, so a
+// name appearing here belongs to a running process at the instant of the call.
+// Used by the MCP gateways tool to annotate each allowlist entry with live
+// availability info.
+func (m *Manager) SubdomainsInUse() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]string, len(m.bySubdomain))
+	for sub, p := range m.bySubdomain {
+		out[sub] = p.ID
+	}
+	return out
+}
+
 func (m *Manager) GetBySubdomain(subdomain string) (*Process, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

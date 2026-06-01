@@ -103,8 +103,15 @@ func (s *Server) startToolDescription() string {
 		if g.Description != "" {
 			fmt.Fprintf(&b, ": %s", g.Description)
 		}
-		fmt.Fprintf(&b, " (URLs: %s)\n", g.URL)
+		fmt.Fprintf(&b, " (URLs: %s", g.URL)
+		if len(g.Subdomains) == 0 {
+			fmt.Fprint(&b, "; subdomain_policy=any")
+		} else {
+			fmt.Fprintf(&b, "; subdomain_policy=allowlist; subdomains=%s", strings.Join(g.Subdomains, ","))
+		}
+		fmt.Fprint(&b, ")\n")
 	}
+	b.WriteString("\nCall the 'gateways' tool to see live in_use status for each allowlisted subdomain.\n")
 	return b.String()
 }
 
@@ -120,7 +127,7 @@ func (s *Server) registerTools() {
 			),
 			mcpgo.WithString("subdomain",
 				mcpgo.Required(),
-				mcpgo.Description("Subdomain prefix the process will be reachable at (DNS-label-safe, e.g. 'myapp')."),
+				mcpgo.Description("DNS-label-safe subdomain prefix the process will be reachable at. Some gateways restrict this to a fixed allowlist — call the 'gateways' tool to see each gateway's 'subdomain_policy'. When 'subdomain_policy' is 'allowlist', pick a free entry (in_use=false) from that gateway's 'subdomains'; when 'any', you may pick any DNS-safe label."),
 			),
 			mcpgo.WithNumber("port",
 				mcpgo.Required(),
@@ -250,8 +257,21 @@ func (s *Server) handleStart(_ context.Context, req mcpgo.CallToolRequest) (*mcp
 	if gateway == "" {
 		return mcpgo.NewToolResultError("gateway is required"), nil
 	}
-	if _, ok := s.gwIndex[gateway]; !ok {
+	gw, ok := s.gwIndex[gateway]
+	if !ok {
 		return mcpgo.NewToolResultError(fmt.Sprintf("unknown gateway %q; valid: %s", gateway, strings.Join(s.gatewayNames(), ", "))), nil
+	}
+	if len(gw.Subdomains) > 0 {
+		allowed := false
+		for _, s := range gw.Subdomains {
+			if s == subdomain {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return mcpgo.NewToolResultError(fmt.Sprintf("subdomain %q not in allowlist for gateway %q; allowed: %s", subdomain, gateway, strings.Join(gw.Subdomains, ", "))), nil
+		}
 	}
 
 	env := map[string]string{}
@@ -348,18 +368,41 @@ func (s *Server) handleLogs(_ context.Context, req mcpgo.CallToolRequest) (*mcpg
 }
 
 func (s *Server) handleGateways(_ context.Context, _ mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-	type gatewayView struct {
-		Name        string `json:"name"`
-		URLTemplate string `json:"url_template"`
-		Description string `json:"description,omitempty"`
+	type subdomainEntry struct {
+		Name      string `json:"name"`
+		InUse     bool   `json:"in_use"`
+		ProcessID string `json:"process_id,omitempty"`
 	}
+	type gatewayView struct {
+		Name            string           `json:"name"`
+		URLTemplate     string           `json:"url_template"`
+		Description     string           `json:"description,omitempty"`
+		SubdomainPolicy string           `json:"subdomain_policy"`
+		Subdomains      []subdomainEntry `json:"subdomains,omitempty"`
+	}
+	inUse := s.mgr.SubdomainsInUse()
 	views := make([]gatewayView, 0, len(s.gateways))
 	for _, g := range s.gateways {
-		views = append(views, gatewayView{
+		v := gatewayView{
 			Name:        g.Name,
 			URLTemplate: g.URL,
 			Description: g.Description,
-		})
+		}
+		if len(g.Subdomains) == 0 {
+			v.SubdomainPolicy = "any"
+		} else {
+			v.SubdomainPolicy = "allowlist"
+			v.Subdomains = make([]subdomainEntry, 0, len(g.Subdomains))
+			for _, sub := range g.Subdomains {
+				entry := subdomainEntry{Name: sub}
+				if pid, ok := inUse[sub]; ok {
+					entry.InUse = true
+					entry.ProcessID = pid
+				}
+				v.Subdomains = append(v.Subdomains, entry)
+			}
+		}
+		views = append(views, v)
 	}
 	return jsonResult(map[string]any{"gateways": views})
 }

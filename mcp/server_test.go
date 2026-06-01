@@ -446,6 +446,32 @@ func TestHandleLogs_LinesCapAndDefault(t *testing.T) {
 
 // ---------- handleGateways ----------
 
+// gatewayResult mirrors handleGateways' JSON shape closely enough for tests to
+// assert against. Fields not under test are still parsed so any drift in JSON
+// names surfaces as a failed assertion rather than a silent skip.
+type gatewayResult struct {
+	Name            string `json:"name"`
+	URLTemplate     string `json:"url_template"`
+	Description     string `json:"description"`
+	SubdomainPolicy string `json:"subdomain_policy"`
+	Subdomains      []struct {
+		Name      string `json:"name"`
+		InUse     bool   `json:"in_use"`
+		ProcessID string `json:"process_id"`
+	} `json:"subdomains"`
+}
+
+func decodeGateways(t *testing.T, raw string) []gatewayResult {
+	t.Helper()
+	var got struct {
+		Gateways []gatewayResult `json:"gateways"`
+	}
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("decode gateways: %v\n%s", err, raw)
+	}
+	return got.Gateways
+}
+
 func TestHandleGateways(t *testing.T) {
 	s := newTestServer(t)
 	res, err := s.handleGateways(context.Background(), callTool(nil))
@@ -455,28 +481,161 @@ func TestHandleGateways(t *testing.T) {
 	if res.IsError {
 		t.Fatal(resultText(t, res))
 	}
-	var got struct {
-		Gateways []struct {
-			Name        string `json:"name"`
-			URLTemplate string `json:"url_template"`
-			Description string `json:"description"`
-		} `json:"gateways"`
+	gws := decodeGateways(t, resultText(t, res))
+	if len(gws) != 2 {
+		t.Fatalf("got %d gateways, want 2", len(gws))
 	}
-	if err := json.Unmarshal([]byte(resultText(t, res)), &got); err != nil {
-		t.Fatal(err)
-	}
-	if len(got.Gateways) != 2 {
-		t.Fatalf("got %d gateways, want 2", len(got.Gateways))
-	}
-	names := []string{got.Gateways[0].Name, got.Gateways[1].Name}
+	names := []string{gws[0].Name, gws[1].Name}
 	sort.Strings(names)
 	if names[0] != "g1" || names[1] != "g2" {
 		t.Errorf("gateway names = %v, want [g1 g2]", names)
 	}
-	for _, g := range got.Gateways {
+	// Neither test gateway has an allowlist, so both must report policy=any
+	// and omit the subdomains array entirely (omitempty in the JSON tag).
+	for _, g := range gws {
+		if g.SubdomainPolicy != "any" {
+			t.Errorf("gateway %q policy = %q, want any", g.Name, g.SubdomainPolicy)
+		}
+		if g.Subdomains != nil {
+			t.Errorf("gateway %q subdomains = %v, want nil for policy=any", g.Name, g.Subdomains)
+		}
 		if g.Name == "g1" && g.Description != "first" {
 			t.Errorf("g1 description = %q, want first", g.Description)
 		}
+	}
+}
+
+// newAllowlistServer is a variant of newTestServer where one gateway carries a
+// fixed allowlist and the other stays wildcard. Used by subdomain-policy tests.
+func newAllowlistServer(t *testing.T) *Server {
+	t.Helper()
+	gws := []config.Gateway{
+		{Name: "fixed", Port: 19092, URL: "https://%s.fixed.example.com", Subdomains: []string{"alpha", "bravo", "charlie"}},
+		{Name: "wild", Port: 19093, URL: "https://%s.wild.example.com"},
+	}
+	mgr := manager.New(20, 0, "")
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		mgr.StopAll(ctx)
+	})
+	return New(mgr, gws, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func TestHandleGateways_SubdomainPolicy(t *testing.T) {
+	s := newAllowlistServer(t)
+	res, err := s.handleGateways(context.Background(), callTool(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gws := decodeGateways(t, resultText(t, res))
+	byName := map[string]gatewayResult{}
+	for _, g := range gws {
+		byName[g.Name] = g
+	}
+	if byName["fixed"].SubdomainPolicy != "allowlist" {
+		t.Errorf("fixed policy = %q, want allowlist", byName["fixed"].SubdomainPolicy)
+	}
+	if len(byName["fixed"].Subdomains) != 3 {
+		t.Errorf("fixed subdomains size = %d, want 3", len(byName["fixed"].Subdomains))
+	}
+	if byName["wild"].SubdomainPolicy != "any" {
+		t.Errorf("wild policy = %q, want any", byName["wild"].SubdomainPolicy)
+	}
+}
+
+func TestHandleGateways_InUseReflectsRunningProcess(t *testing.T) {
+	s := newAllowlistServer(t)
+	bin := writeSleepBin(t)
+	p, err := s.mgr.Start(manager.StartOptions{
+		BinaryPath: bin, Subdomain: "alpha", Port: freePort(t), Gateway: "fixed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.handleGateways(context.Background(), callTool(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gws := decodeGateways(t, resultText(t, res))
+	var fixed gatewayResult
+	for _, g := range gws {
+		if g.Name == "fixed" {
+			fixed = g
+		}
+	}
+	seenAlphaInUse := false
+	for _, e := range fixed.Subdomains {
+		switch e.Name {
+		case "alpha":
+			if !e.InUse || e.ProcessID != p.ID {
+				t.Errorf("alpha: in_use=%v pid=%q, want true / %q", e.InUse, e.ProcessID, p.ID)
+			}
+			seenAlphaInUse = true
+		default:
+			if e.InUse || e.ProcessID != "" {
+				t.Errorf("%s: in_use=%v pid=%q, want unused", e.Name, e.InUse, e.ProcessID)
+			}
+		}
+	}
+	if !seenAlphaInUse {
+		t.Errorf("alpha not present in subdomains list: %+v", fixed.Subdomains)
+	}
+}
+
+// ---------- subdomain allowlist enforcement on start ----------
+
+func TestHandleStart_AllowlistRejectsUnknownSubdomain(t *testing.T) {
+	s := newAllowlistServer(t)
+	bin := writeSleepBin(t)
+	res, err := s.handleStart(context.Background(), callTool(map[string]any{
+		"binary_path": bin, "subdomain": "notlisted", "gateway": "fixed", "port": float64(freePort(t)),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected rejection, got success: %s", resultText(t, res))
+	}
+	msg := resultText(t, res)
+	if !strings.Contains(msg, "not in allowlist") {
+		t.Errorf("error %q does not mention allowlist", msg)
+	}
+	// The error must enumerate the allowed names so the AI can self-correct
+	// without another tool call.
+	for _, want := range []string{"alpha", "bravo", "charlie"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not list allowed subdomain %q", msg, want)
+		}
+	}
+}
+
+func TestHandleStart_AllowlistAcceptsListedSubdomain(t *testing.T) {
+	s := newAllowlistServer(t)
+	bin := writeSleepBin(t)
+	res, err := s.handleStart(context.Background(), callTool(map[string]any{
+		"binary_path": bin, "subdomain": "bravo", "gateway": "fixed", "port": float64(freePort(t)),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success for allowlisted subdomain, got error: %s", resultText(t, res))
+	}
+}
+
+func TestHandleStart_WildcardGatewayAcceptsAny(t *testing.T) {
+	s := newAllowlistServer(t)
+	bin := writeSleepBin(t)
+	res, err := s.handleStart(context.Background(), callTool(map[string]any{
+		"binary_path": bin, "subdomain": "anything", "gateway": "wild", "port": float64(freePort(t)),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success for wildcard gateway, got error: %s", resultText(t, res))
 	}
 }
 

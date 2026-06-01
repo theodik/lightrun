@@ -15,11 +15,18 @@ import (
 // Traefik router with its own middleware chain — lightrun itself only routes
 // processes to the matching listener and has no opinion on what middleware
 // (auth, rate limit, IP allowlist, ...) sits in front.
+//
+// Subdomains, when non-empty, fixes the set of subdomain labels the gateway
+// will accept in start tool calls. It's the natural fit when Traefik is using
+// HTTP-01 — every name needs a concrete router/cert ahead of time. An empty
+// Subdomains slice means "any DNS-safe label is fine" (the wildcard /
+// HostRegexp + DNS-01 setup).
 type Gateway struct {
 	Name        string
 	Port        int
 	URL         string // template with %s for subdomain
 	Description string
+	Subdomains  []string
 }
 
 type Config struct {
@@ -51,10 +58,16 @@ func Load() (Config, error) {
 }
 
 // LIGHTRUN_GATEWAY_<NAME>_<FIELD> where NAME may contain '_' (becomes '-' in
-// the lowercased gateway name) and FIELD is one of PORT, URL, DESCRIPTION.
-var gatewayEnvRe = regexp.MustCompile(`^LIGHTRUN_GATEWAY_([A-Z0-9][A-Z0-9_]*?)_(PORT|URL|DESCRIPTION)$`)
+// the lowercased gateway name) and FIELD is one of PORT, URL, DESCRIPTION,
+// SUBDOMAINS.
+var gatewayEnvRe = regexp.MustCompile(`^LIGHTRUN_GATEWAY_([A-Z0-9][A-Z0-9_]*?)_(PORT|URL|DESCRIPTION|SUBDOMAINS)$`)
 
 var gatewayNameRe = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+
+// subdomainRe mirrors manager.subdomainRe — both validate the same DNS label
+// format. Bump in lockstep; the duplication keeps config from depending on
+// manager so the package graph stays one-directional.
+var subdomainRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 func parseGateways(environ []string) ([]Gateway, error) {
 	raw := make(map[string]map[string]string)
@@ -113,14 +126,48 @@ func parseGateways(environ []string) ([]Gateway, error) {
 			return nil, fmt.Errorf("gateway %q: URL %q must contain %%s placeholder for subdomain", n, url)
 		}
 
+		subdomains, err := parseSubdomains(n, fields["SUBDOMAINS"])
+		if err != nil {
+			return nil, err
+		}
+
 		gateways = append(gateways, Gateway{
 			Name:        n,
 			Port:        port,
 			URL:         url,
 			Description: fields["DESCRIPTION"],
+			Subdomains:  subdomains,
 		})
 	}
 	return gateways, nil
+}
+
+// parseSubdomains splits a comma-separated allowlist, normalises each entry
+// (trim, lowercase), drops empties, dedupes, validates each remaining label
+// against the DNS regex, and returns them sorted for deterministic output.
+// Empty input → nil (no restriction).
+func parseSubdomains(gateway, raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, piece := range strings.Split(raw, ",") {
+		sub := strings.ToLower(strings.TrimSpace(piece))
+		if sub == "" {
+			continue
+		}
+		if !subdomainRe.MatchString(sub) {
+			return nil, fmt.Errorf("gateway %q: invalid subdomain %q in SUBDOMAINS", gateway, sub)
+		}
+		if seen[sub] {
+			continue
+		}
+		seen[sub] = true
+		out = append(out, sub)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // binaryBaseDir is the directory that 'start' tool callers can reference via a

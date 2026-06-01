@@ -34,6 +34,53 @@ func TestParseGateways_Happy(t *testing.T) {
 	}
 }
 
+func TestParseGateways_Subdomains(t *testing.T) {
+	environ := []string{
+		"LIGHTRUN_GATEWAY_AUTH_PORT=18080",
+		"LIGHTRUN_GATEWAY_AUTH_URL=https://%s.app.example.com",
+		// Whitespace, mixed case, an empty piece, and a duplicate — all should
+		// be normalised away. The final order is deterministic (sorted).
+		"LIGHTRUN_GATEWAY_AUTH_SUBDOMAINS=charlie, Alpha ,, bravo,alpha",
+		"LIGHTRUN_GATEWAY_PUBLIC_PORT=18081",
+		"LIGHTRUN_GATEWAY_PUBLIC_URL=https://%s.pub.example.com",
+		// Unset SUBDOMAINS → nil slice (wildcard / no restriction).
+	}
+	gws, err := parseGateways(environ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gws[0].Subdomains; !equalStrings(got, []string{"alpha", "bravo", "charlie"}) {
+		t.Errorf("auth subdomains = %v, want [alpha bravo charlie]", got)
+	}
+	if gws[1].Subdomains != nil {
+		t.Errorf("public subdomains = %v, want nil", gws[1].Subdomains)
+	}
+}
+
+func TestParseGateways_InvalidSubdomain(t *testing.T) {
+	environ := []string{
+		"LIGHTRUN_GATEWAY_X_PORT=18080",
+		"LIGHTRUN_GATEWAY_X_URL=https://%s.example.com",
+		"LIGHTRUN_GATEWAY_X_SUBDOMAINS=alpha,BAD_NAME,charlie",
+	}
+	_, err := parseGateways(environ)
+	if err == nil || !strings.Contains(err.Error(), "invalid subdomain") {
+		t.Errorf("got %v, want invalid-subdomain error", err)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestParseGateways_UnderscoreInName(t *testing.T) {
 	environ := []string{
 		"LIGHTRUN_GATEWAY_ADMIN_ONLY_PORT=18090",

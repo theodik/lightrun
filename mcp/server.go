@@ -24,6 +24,10 @@ type Server struct {
 	logger   *slog.Logger
 	mcp      *server.MCPServer
 	http     *server.StreamableHTTPServer
+	extra    []struct {
+		pattern string
+		handler http.Handler
+	}
 }
 
 func New(mgr *manager.Manager, gateways []config.Gateway, logger *slog.Logger) *Server {
@@ -47,6 +51,15 @@ func New(mgr *manager.Manager, gateways []config.Gateway, logger *slog.Logger) *
 	return s
 }
 
+// Handle registers an additional route on the HTTP server started by Run.
+// It must be called before Run.
+func (s *Server) Handle(pattern string, h http.Handler) {
+	s.extra = append(s.extra, struct {
+		pattern string
+		handler http.Handler
+	}{pattern: pattern, handler: h})
+}
+
 // Run starts the MCP HTTP listener and blocks until ctx is cancelled or the
 // listener errors. The MCP streamable transport is served at /mcp and a
 // liveness check is served at /health. On cancel it triggers a graceful
@@ -59,6 +72,9 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	for _, e := range s.extra {
+		mux.Handle(e.pattern, e.handler)
+	}
 
 	srv := &http.Server{Addr: addr, Handler: mux}
 	s.logger.Info("mcp listening", "addr", addr)
@@ -122,8 +138,10 @@ func (s *Server) registerTools() {
 		mcpgo.NewTool("start",
 			mcpgo.WithDescription(s.startToolDescription()),
 			mcpgo.WithString("binary_path",
-				mcpgo.Required(),
-				mcpgo.Description("Path to the executable to launch. Absolute paths are used as-is. A leading '~' (or '~/...') is expanded against lightrun's configured binary base dir (LIGHTRUN_BINARY_BASE_DIR, defaults to lightrun's $HOME) — use this so callers don't need to know lightrun's absolute layout."),
+				mcpgo.Description("Path to the executable to launch. Absolute paths are used as-is. A leading '~' (or '~/...') is expanded against lightrun's configured binary base dir (LIGHTRUN_BINARY_BASE_DIR, defaults to lightrun's $HOME) — use this so callers don't need to know lightrun's absolute layout. Required if 'command' is not provided."),
+			),
+			mcpgo.WithString("command",
+				mcpgo.Description("Shell command string to execute via /bin/sh -c (e.g. 'npm run dev', 'go run ./cmd/server'). Required if 'binary_path' is not provided. Recommended: also set working_dir to the project directory."),
 			),
 			mcpgo.WithString("subdomain",
 				mcpgo.Required(),
@@ -142,10 +160,39 @@ func (s *Server) registerTools() {
 				mcpgo.Description("Optional map of additional environment variables (string -> string)."),
 			),
 			mcpgo.WithString("working_dir",
-				mcpgo.Description("Optional working directory for the child process. Defaults to the directory containing binary_path — match this to whatever 'cd' the app's run script would do, since most apps resolve sibling paths (web/, tmp/, ./db) relative to CWD. Same '~' expansion as binary_path."),
+				mcpgo.Description("Optional working directory for the child process. For binary_path mode defaults to the binary's directory; for command mode defaults to lightrun's home. Same '~' expansion as binary_path. Always set this when using 'command' so npm/go can find project files."),
+			),
+			mcpgo.WithString("name",
+				mcpgo.Description("Optional human-readable name that registers this as a named command visible in the lightrun dashboard. Named commands persist across restarts and can be run/stopped from the web UI with one tap. Example: 'Dev Server', 'DB Seed'."),
+			),
+			mcpgo.WithString("description",
+				mcpgo.Description("Optional short description of what this command does. Shown in the dashboard below the name."),
 			),
 		),
 		s.handleStart,
+	)
+
+	s.mcp.AddTool(
+		mcpgo.NewTool("run_command",
+			mcpgo.WithDescription("Run a named command registered in the dashboard by its subdomain. If the command is already running, returns the existing process without starting a second instance (idempotent). Use 'list_commands' to see registered subdomains."),
+			mcpgo.WithString("subdomain", mcpgo.Required(), mcpgo.Description("The subdomain of the registered command to run.")),
+		),
+		s.handleRunCommand,
+	)
+
+	s.mcp.AddTool(
+		mcpgo.NewTool("list_commands",
+			mcpgo.WithDescription("List all named commands registered in the lightrun dashboard, with their current running status."),
+		),
+		s.handleListCommands,
+	)
+
+	s.mcp.AddTool(
+		mcpgo.NewTool("unregister_command",
+			mcpgo.WithDescription("Remove a named command from the dashboard registry by subdomain. If it is currently running, lightrun stops the process first."),
+			mcpgo.WithString("subdomain", mcpgo.Required(), mcpgo.Description("The subdomain of the registered command to remove.")),
+		),
+		s.handleUnregisterCommand,
 	)
 
 	s.mcp.AddTool(
@@ -190,19 +237,22 @@ func (s *Server) registerTools() {
 }
 
 type processView struct {
-	ID         string   `json:"id"`
-	BinaryPath string   `json:"binary_path"`
-	WorkingDir string   `json:"working_dir"`
-	Subdomain  string   `json:"subdomain"`
-	URL        string   `json:"url"`
-	Port       int      `json:"port"`
-	Gateway    string   `json:"gateway"`
-	Status     string   `json:"status"`
-	Health     string   `json:"health"`
-	StartTime  string   `json:"start_time"`
-	UptimeSec  int64    `json:"uptime_sec"`
-	ExitCode   *int     `json:"exit_code,omitempty"`
-	RecentLogs []string `json:"recent_logs,omitempty"`
+	ID          string   `json:"id"`
+	BinaryPath  string   `json:"binary_path,omitempty"`
+	Command     string   `json:"command,omitempty"`
+	WorkingDir  string   `json:"working_dir"`
+	Subdomain   string   `json:"subdomain"`
+	Name        string   `json:"name,omitempty"`
+	Description string   `json:"description,omitempty"`
+	URL         string   `json:"url"`
+	Port        int      `json:"port"`
+	Gateway     string   `json:"gateway"`
+	Status      string   `json:"status"`
+	Health      string   `json:"health"`
+	StartTime   string   `json:"start_time"`
+	UptimeSec   int64    `json:"uptime_sec"`
+	ExitCode    *int     `json:"exit_code,omitempty"`
+	RecentLogs  []string `json:"recent_logs,omitempty"`
 }
 
 func (s *Server) view(p *manager.Process, includeLogs int) processView {
@@ -211,17 +261,20 @@ func (s *Server) view(p *manager.Process, includeLogs int) processView {
 		url = fmt.Sprintf(gw.URL, p.Subdomain)
 	}
 	v := processView{
-		ID:         p.ID,
-		BinaryPath: p.BinaryPath,
-		WorkingDir: p.WorkingDir,
-		Subdomain:  p.Subdomain,
-		URL:        url,
-		Port:       p.Port,
-		Gateway:    p.Gateway,
-		Status:     p.Status().String(),
-		Health:     p.Health().String(),
-		StartTime:  p.StartTime.UTC().Format(time.RFC3339),
-		UptimeSec:  int64(time.Since(p.StartTime).Seconds()),
+		ID:          p.ID,
+		BinaryPath:  p.BinaryPath,
+		Command:     p.Command,
+		WorkingDir:  p.WorkingDir,
+		Subdomain:   p.Subdomain,
+		Name:        p.Name,
+		Description: p.Description,
+		URL:         url,
+		Port:        p.Port,
+		Gateway:     p.Gateway,
+		Status:      p.Status().String(),
+		Health:      p.Health().String(),
+		StartTime:   p.StartTime.UTC().Format(time.RFC3339),
+		UptimeSec:   int64(time.Since(p.StartTime).Seconds()),
 	}
 	if p.Status() == manager.StatusStopped {
 		code, _ := p.ExitInfo()
@@ -237,9 +290,17 @@ func (s *Server) handleStart(_ context.Context, req mcpgo.CallToolRequest) (*mcp
 	args := req.GetArguments()
 
 	binaryPath, _ := args["binary_path"].(string)
+	command, _ := args["command"].(string)
+	binaryPath = strings.TrimSpace(binaryPath)
+	command = strings.TrimSpace(command)
+	if (binaryPath == "") == (command == "") {
+		return mcpgo.NewToolResultError("exactly one of binary_path or command is required"), nil
+	}
 	subdomain, _ := args["subdomain"].(string)
 	gateway, _ := args["gateway"].(string)
 	workingDir, _ := args["working_dir"].(string)
+	name, _ := args["name"].(string)
+	description, _ := args["description"].(string)
 
 	portRaw, ok := args["port"]
 	if !ok {
@@ -263,8 +324,8 @@ func (s *Server) handleStart(_ context.Context, req mcpgo.CallToolRequest) (*mcp
 	}
 	if len(gw.Subdomains) > 0 {
 		allowed := false
-		for _, s := range gw.Subdomains {
-			if s == subdomain {
+		for _, sub := range gw.Subdomains {
+			if sub == subdomain {
 				allowed = true
 				break
 			}
@@ -286,18 +347,81 @@ func (s *Server) handleStart(_ context.Context, req mcpgo.CallToolRequest) (*mcp
 	}
 
 	p, err := s.mgr.Start(manager.StartOptions{
-		BinaryPath: binaryPath,
-		Subdomain:  subdomain,
-		Port:       port,
-		Env:        env,
-		Gateway:    gateway,
-		WorkingDir: workingDir,
+		BinaryPath:  binaryPath,
+		Command:     command,
+		Subdomain:   subdomain,
+		Port:        port,
+		Env:         env,
+		Gateway:     gateway,
+		WorkingDir:  workingDir,
+		Name:        name,
+		Description: description,
 	})
 	if err != nil {
 		return mcpgo.NewToolResultError(err.Error()), nil
 	}
 
 	return jsonResult(s.view(p, 0))
+}
+
+func (s *Server) handleRunCommand(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	subdomain, _ := req.GetArguments()["subdomain"].(string)
+	if subdomain == "" {
+		return mcpgo.NewToolResultError("subdomain is required"), nil
+	}
+	p, alreadyRunning, err := s.mgr.RunCommand(subdomain)
+	if err != nil {
+		return mcpgo.NewToolResultError(err.Error()), nil
+	}
+	v := s.view(p, 0)
+	return jsonResult(map[string]any{"process": v, "already_running": alreadyRunning})
+}
+
+func (s *Server) handleListCommands(_ context.Context, _ mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	type commandEntry struct {
+		Subdomain   string `json:"subdomain"`
+		Name        string `json:"name"`
+		Description string `json:"description,omitempty"`
+		DisplayCmd  string `json:"display_cmd"`
+		Running     bool   `json:"running"`
+		ProcessID   string `json:"process_id,omitempty"`
+		Status      string `json:"status"`
+	}
+	desired := s.mgr.ListDesired()
+	entries := make([]commandEntry, 0, len(desired))
+	for _, opts := range desired {
+		if opts.Name == "" {
+			continue
+		}
+		e := commandEntry{
+			Subdomain:   opts.Subdomain,
+			Name:        opts.Name,
+			Description: opts.Description,
+			DisplayCmd:  opts.Command,
+			Status:      "stopped",
+		}
+		if e.DisplayCmd == "" {
+			e.DisplayCmd = opts.BinaryPath
+		}
+		if p, ok := s.mgr.GetBySubdomain(opts.Subdomain); ok && p.Status() == manager.StatusRunning {
+			e.Running = true
+			e.ProcessID = p.ID
+			e.Status = "running"
+		}
+		entries = append(entries, e)
+	}
+	return jsonResult(map[string]any{"commands": entries})
+}
+
+func (s *Server) handleUnregisterCommand(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	subdomain, _ := req.GetArguments()["subdomain"].(string)
+	if subdomain == "" {
+		return mcpgo.NewToolResultError("subdomain is required"), nil
+	}
+	if err := s.mgr.UnregisterCommand(subdomain); err != nil {
+		return mcpgo.NewToolResultError(err.Error()), nil
+	}
+	return jsonResult(map[string]any{"subdomain": subdomain, "removed": true})
 }
 
 func (s *Server) handleStop(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {

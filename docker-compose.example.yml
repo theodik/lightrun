@@ -23,10 +23,18 @@ services:
       # Shared with the container that produces the binaries. Read-only from
       # lightrun's perspective is fine — it only needs exec, not write.
       - workspace-home:/workspace:ro
+      # Writable volume for the persisted named command registry. Lightrun
+      # rewrites this when commands are registered or updated, and loads it on
+      # boot so dashboard commands survive a restart of the lightrun container.
+      # Must NOT be the read-only workspace mount above — keep it writable.
+      - lightrun-state:/var/lib/lightrun
     environment:
       LIGHTRUN_MCP_PORT: "18082"
       LIGHTRUN_LOG_BUFFER_SIZE: "1000"
       LIGHTRUN_STOPPED_TTL: "1h"
+      # Where the command registry is persisted (default shown). Set to "off"
+      # to disable persistence and start with a clean slate every boot.
+      LIGHTRUN_STATE_FILE: "/var/lib/lightrun/state.json"
 
       # One gateway per Traefik router. PORT is the listener inside this
       # container. URL is the template returned to MCP callers (use %s for
@@ -94,6 +102,7 @@ services:
 
 volumes:
   workspace-home:
+  lightrun-state:
 
 networks:
   internal:

@@ -99,7 +99,7 @@ func resultText(t *testing.T, res *mcpgo.CallToolResult) string {
 func TestRegisteredTools(t *testing.T) {
 	s := newTestServer(t)
 	got := s.mcp.ListTools()
-	want := []string{"start", "stop", "restart", "status", "logs", "gateways"}
+	want := []string{"start", "stop", "restart", "status", "logs", "gateways", "run_command", "list_commands", "unregister_command"}
 	for _, name := range want {
 		if _, ok := got[name]; !ok {
 			t.Errorf("missing tool %q", name)
@@ -143,7 +143,8 @@ func TestStartTool_Schema(t *testing.T) {
 	for _, r := range schema.Required {
 		required[r] = true
 	}
-	for _, name := range []string{"binary_path", "subdomain", "port", "gateway"} {
+	// binary_path and command are optional (either-or); only these three are required.
+	for _, name := range []string{"subdomain", "port", "gateway"} {
 		if !required[name] {
 			t.Errorf("expected %q to be required, got Required=%v", name, schema.Required)
 		}
@@ -198,6 +199,47 @@ func TestHandleStart_PortValidation(t *testing.T) {
 			}
 			if !strings.Contains(resultText(t, res), c.want) {
 				t.Errorf("error %q does not contain %q", resultText(t, res), c.want)
+			}
+		})
+	}
+}
+
+func TestHandleStart_LaunchModeValidation(t *testing.T) {
+	s := newTestServer(t)
+	bin := writeSleepBin(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		args map[string]any
+	}{
+		{
+			name: "neither",
+			args: map[string]any{
+				"subdomain": "a",
+				"gateway":   "g1",
+				"port":      float64(freePort(t)),
+			},
+		},
+		{
+			name: "both",
+			args: map[string]any{
+				"binary_path": bin,
+				"command":     "echo hi",
+				"subdomain":   "b",
+				"gateway":     "g1",
+				"port":        float64(freePort(t)),
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			res, err := s.handleStart(ctx, callTool(c.args))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !res.IsError || !strings.Contains(resultText(t, res), "exactly one") {
+				t.Fatalf("expected exactly-one launch mode error, got %q", resultText(t, res))
 			}
 		})
 	}
@@ -307,6 +349,49 @@ func TestHandleStop_HappyPath(t *testing.T) {
 	}
 	if p.Status() != manager.StatusStopped {
 		t.Errorf("process status = %s, want stopped", p.Status())
+	}
+}
+
+func TestHandleUnregisterCommand_RemovesAndStops(t *testing.T) {
+	s := newTestServer(t)
+	bin := writeSleepBin(t)
+	p, err := s.mgr.Start(manager.StartOptions{
+		BinaryPath: bin,
+		Name:       "Remove command",
+		Subdomain:  "remove-cmd",
+		Port:       freePort(t),
+		Gateway:    "g1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.handleUnregisterCommand(context.Background(), callTool(map[string]any{"subdomain": "remove-cmd"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	if p.Status() != manager.StatusStopped {
+		t.Fatalf("process status = %s, want stopped", p.Status())
+	}
+	if _, ok := s.mgr.GetDesired("remove-cmd"); ok {
+		t.Fatal("command still registered after unregister")
+	}
+	if !strings.Contains(resultText(t, res), `"removed":true`) {
+		t.Fatalf("response %q does not confirm removal", resultText(t, res))
+	}
+}
+
+func TestHandleUnregisterCommand_NotFound(t *testing.T) {
+	s := newTestServer(t)
+	res, err := s.handleUnregisterCommand(context.Background(), callTool(map[string]any{"subdomain": "ghost"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(resultText(t, res), "no registered command") {
+		t.Fatalf("expected not-found unregister error, got %q", resultText(t, res))
 	}
 }
 

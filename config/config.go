@@ -34,6 +34,7 @@ type Config struct {
 	LogBufferSize int
 	StoppedTTL    time.Duration // 0 disables the janitor — stopped processes are kept forever
 	BinaryBaseDir string        // resolves the leading '~' in start-tool binary_path; default $HOME
+	StateFile     string        // path to the persisted command registry; "off" disables persistence
 	Gateways      []Gateway
 }
 
@@ -43,6 +44,7 @@ func Load() (Config, error) {
 		LogBufferSize: envInt("LIGHTRUN_LOG_BUFFER_SIZE", 1000),
 		StoppedTTL:    envDuration("LIGHTRUN_STOPPED_TTL", time.Hour),
 		BinaryBaseDir: binaryBaseDir(),
+		StateFile:     stateFile(),
 	}
 	gws, err := parseGateways(os.Environ())
 	if err != nil {
@@ -182,6 +184,17 @@ func binaryBaseDir() string {
 		return h
 	}
 	return ""
+}
+
+// stateFile is the path where lightrun remembers registered commands.
+// Defaults to a dedicated writable path rather than under BinaryBaseDir,
+// which is typically a read-only build volume. Set LIGHTRUN_STATE_FILE to
+// relocate it, or to "off" to disable persistence entirely.
+func stateFile() string {
+	if v := os.Getenv("LIGHTRUN_STATE_FILE"); v != "" {
+		return v
+	}
+	return "/var/lib/lightrun/state.json"
 }
 
 func envInt(key string, def int) int {

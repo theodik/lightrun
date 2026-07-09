@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Register Command - lightrun</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    :root {
+      --pico-font-size: 96%;
+      --pico-border-radius: 6px;
+    }
+    body {
+      min-height: 100vh;
+      background: #f8faf9;
+      color: #18211f;
+    }
+    main {
+      width: min(760px, calc(100% - 32px));
+      margin: 0 auto;
+      padding-block: 24px 40px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.45rem;
+      line-height: 1.15;
+    }
+    header a {
+      white-space: nowrap;
+      color: #667772;
+      font-size: 0.88rem;
+      text-decoration: none;
+    }
+    .panel {
+      background: #fff;
+      border: 1px solid #dfe7e3;
+      border-radius: 8px;
+      padding: 18px;
+    }
+    form { margin: 0; }
+    label { font-size: 0.88rem; }
+    .field-grid {
+      display: grid;
+      grid-template-columns: 1fr 130px;
+      gap: 10px;
+    }
+    .divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: #8a9e99;
+      font-size: 0.8rem;
+      margin-block: 6px;
+    }
+    .divider::before, .divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: #dfe7e3;
+    }
+    .form-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .form-actions a,
+    .form-actions button {
+      width: auto;
+      margin: 0;
+    }
+    #message {
+      min-height: 1.4rem;
+      margin-top: 12px;
+      color: #8a2f18;
+      font-size: 0.88rem;
+    }
+    @media (max-width: 640px) {
+      main { width: calc(100% - 20px); padding-top: 14px; }
+      header, .form-actions { align-items: flex-start; flex-direction: column; }
+      .field-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Register Command</h1>
+      <a href="/">← Dashboard</a>
+    </header>
+
+    <section class="panel">
+      <form id="start-form">
+        <label>
+          Name <small style="color:#8a9e99;font-weight:normal">(optional — makes it a named dashboard command)</small>
+          <input name="name" autocomplete="off" placeholder="Dev Server">
+        </label>
+        <label>
+          Description <small style="color:#8a9e99;font-weight:normal">(optional)</small>
+          <input name="description" autocomplete="off" placeholder="Starts the hackermmo development server">
+        </label>
+
+        <label>
+          Shell command
+          <input name="command" autocomplete="off" id="command-input" placeholder="npm run dev">
+        </label>
+        <div class="divider">or</div>
+        <label>
+          Binary path
+          <input name="binary_path" autocomplete="off" id="binary-input" placeholder="~/app/run.sh">
+        </label>
+        <label>
+          Working directory
+          <input name="working_dir" autocomplete="off" placeholder="~/projects/hackermmo">
+        </label>
+
+        <div class="field-grid">
+          <label>
+            Subdomain
+            <input name="subdomain" autocomplete="off" required placeholder="app1">
+          </label>
+          <label>
+            Port
+            <input name="port" type="number" min="1" max="65535" required placeholder="3000">
+          </label>
+        </div>
+        <label>
+          Gateway
+          <select name="gateway" id="gateway-select" required></select>
+        </label>
+        <label>
+          Env JSON <small style="color:#8a9e99;font-weight:normal">(optional)</small>
+          <textarea name="env" rows="3" spellcheck="false" placeholder='{"NODE_ENV":"production"}'></textarea>
+        </label>
+        <div class="form-actions">
+          <a href="/" role="button" class="secondary">Cancel</a>
+          <button type="submit" id="submit-btn">Start</button>
+        </div>
+        <div id="message" role="status"></div>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    const message   = document.querySelector('#message');
+    const cmdInput  = document.querySelector('#command-input');
+    const binInput  = document.querySelector('#binary-input');
+    const submitBtn = document.querySelector('#submit-btn');
+    const nameInput = document.querySelector('[name=name]');
+
+    function setMessage(text, isError = true) {
+      message.textContent = text;
+      message.style.color = isError ? '#8a2f18' : '#1c6b45';
+    }
+
+    async function request(path, options = {}) {
+      const res = await fetch(path, {
+        headers: {'Content-Type': 'application/json', ...(options.headers || {})},
+        ...options
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    }
+
+    async function loadGateways() {
+      const data = await request('/api/gateways');
+      const select = document.querySelector('#gateway-select');
+      select.replaceChildren(...data.gateways.map((gateway) => {
+        const option = document.createElement('option');
+        option.value = gateway.name;
+        option.textContent = gateway.description ? `${gateway.name} — ${gateway.description}` : gateway.name;
+        return option;
+      }));
+    }
+
+    document.querySelector('#start-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const formData = new FormData(form);
+
+      const command    = String(formData.get('command') || '').trim();
+      const binaryPath = String(formData.get('binary_path') || '').trim();
+      if (!command && !binaryPath) {
+        setMessage('Provide either a shell command or a binary path.');
+        return;
+      }
+      if (command && binaryPath) {
+        setMessage('Provide a shell command or a binary path, not both.');
+        return;
+      }
+
+      let env = undefined;
+      const rawEnv = String(formData.get('env') || '').trim();
+      if (rawEnv) {
+        try {
+          env = JSON.parse(rawEnv);
+        } catch {
+          setMessage('Env must be valid JSON.');
+          return;
+        }
+      }
+
+      const name      = String(formData.get('name') || '').trim();
+      const subdomain = String(formData.get('subdomain') || '').trim();
+      const payload = {
+        name,
+        description: String(formData.get('description') || '').trim(),
+        command,
+        binary_path: binaryPath,
+        working_dir: String(formData.get('working_dir') || '').trim(),
+        subdomain,
+        port: Number(formData.get('port')),
+        gateway: String(formData.get('gateway') || ''),
+        env,
+      };
+
+      try {
+        submitBtn.disabled = true;
+        await request('/api/processes', {method: 'POST', body: JSON.stringify(payload)});
+        setMessage('Started.', false);
+        if (name) {
+          window.location.assign('/commands/' + encodeURIComponent(subdomain));
+        } else {
+          window.location.assign('/');
+        }
+      } catch (error) {
+        setMessage(error.message);
+        submitBtn.disabled = false;
+      }
+    });
+
+    loadGateways().catch((error) => setMessage(error.message));
+  </script>
+</body>
+</html>

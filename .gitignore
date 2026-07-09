@@ -1,4 +1,6 @@
 /lightrun
+/lightrun-web
+/WEB_UI_PLAN.md
 *.test
 coverage.out
 coverage.html

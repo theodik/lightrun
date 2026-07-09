@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Command - lightrun</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <script type="module" src="/static/vendor/datastar.js"></script>
+  <style>
+    :root {
+      --pico-font-size: 96%;
+      --pico-border-radius: 6px;
+    }
+    body {
+      min-height: 100vh;
+      background: #f8faf9;
+      color: #18211f;
+    }
+    main {
+      width: min(900px, calc(100% - 32px));
+      margin: 0 auto;
+      padding-block: 24px 40px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+    header a.back {
+      color: #667772;
+      font-size: 0.88rem;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    header a.back:hover { color: #18211f; }
+    h1 {
+      margin: 0;
+      font-size: 1.35rem;
+      flex: 1;
+    }
+    .badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .badge-running   { background: #dcf5ea; color: #1c6b45; }
+    .badge-stopped   { background: #f0f0ef; color: #555; }
+    .badge-healthy   { background: #dcf5ea; color: #1c6b45; }
+    .badge-unhealthy { background: #fde8e3; color: #8a2f18; }
+    .badge-starting  { background: #fef6dc; color: #7a5c00; }
+    .shell {
+      background: #fff;
+      border: 1px solid #dfe7e3;
+      border-radius: 8px;
+      padding: 18px;
+      margin-bottom: 16px;
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .cmd-string {
+      font-family: monospace;
+      font-size: 0.88rem;
+      color: #667772;
+      background: #f4f7f5;
+      padding: 4px 10px;
+      border-radius: 4px;
+      word-break: break-all;
+      flex: 1;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .actions button, .actions a {
+      width: auto;
+      margin: 0;
+      padding: 9px 20px;
+      font-size: 0.9rem;
+    }
+    .actions a.disabled {
+      opacity: 0.55;
+      pointer-events: none;
+    }
+    #cmd-heading {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 1;
+      flex-wrap: wrap;
+    }
+    .logs-section h2 {
+      font-size: 1rem;
+      margin: 0 0 10px;
+    }
+    pre#log-output {
+      margin: 0;
+      max-height: 55vh;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: #101615;
+      color: #d7efe5;
+      border-radius: 6px;
+      padding: 14px;
+      font-size: 0.82rem;
+      line-height: 1.5;
+    }
+    #status-msg {
+      min-height: 1.3rem;
+      margin-top: 10px;
+      font-size: 0.88rem;
+      color: #8a2f18;
+    }
+    .description {
+      color: #5a6e69;
+      font-size: 0.9rem;
+      margin-bottom: 4px;
+    }
+    @media (max-width: 600px) {
+      main { width: calc(100% - 20px); padding-top: 14px; }
+      header { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body data-init="@get('/api/commands/' + window.location.pathname.split('/').pop() + '/events')">
+  <main>
+    <header>
+      <a class="back" href="/">← Dashboard</a>
+      <div id="cmd-heading">
+        <h1 id="cmd-name">…</h1>
+        <span id="status-badge" class="badge badge-stopped">stopped</span>
+        <span id="health-badge" class="badge badge-stopped">-</span>
+      </div>
+    </header>
+
+    <section class="shell">
+      <div id="cmd-meta">
+        <p id="cmd-description" class="description" hidden></p>
+        <div class="meta">
+          <code id="cmd-string" class="cmd-string"></code>
+        </div>
+      </div>
+      <div id="cmd-actions" class="actions">
+        <button id="btn-run" type="button" data-command-action="run">Run ▶</button>
+        <button id="btn-stop" type="button" class="secondary" data-command-action="stop" disabled>Stop</button>
+        <button id="btn-restart" type="button" class="secondary" data-command-action="restart">Restart</button>
+        <button id="btn-remove" type="button" class="contrast" data-command-action="remove">Remove</button>
+      </div>
+      <p id="status-msg" role="status"></p>
+    </section>
+
+    <section class="shell logs-section">
+      <h2>Logs</h2>
+      <pre id="log-output">Waiting for logs…</pre>
+    </section>
+  </main>
+
+  <script>
+    const subdomain = window.location.pathname.split('/').pop();
+    const elStatusMsg = document.getElementById('status-msg');
+
+    function setMsg(text, isError = true) {
+      elStatusMsg.textContent = text;
+      elStatusMsg.style.color = isError ? '#8a2f18' : '#1c6b45';
+    }
+
+    async function request(path, options = {}) {
+      const res = await fetch(path, {
+        headers: {'Content-Type': 'application/json', ...(options.headers || {})},
+        ...options
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    }
+
+    let logWasAtBottom = true;
+
+    function syncTitleAndScroll() {
+      const name = document.getElementById('cmd-name');
+      if (name && name.textContent && name.textContent !== '…') {
+        document.title = name.textContent + ' - lightrun';
+      }
+      const log = document.getElementById('log-output');
+      if (log && logWasAtBottom) {
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+
+    document.addEventListener('scroll', (event) => {
+      if (event.target && event.target.id === 'log-output') {
+        const log = event.target;
+        logWasAtBottom = log.scrollHeight - log.scrollTop <= log.clientHeight + 40;
+      }
+    }, true);
+
+    new MutationObserver(syncTitleAndScroll).observe(document.body, {childList: true, subtree: true});
+
+    document.addEventListener('click', async (event) => {
+      const btn = event.target.closest('[data-command-action]');
+      if (!btn) return;
+      const action = btn.dataset.commandAction;
+      try {
+        setMsg(action === 'run' ? 'Starting…' : action === 'stop' ? 'Stopping…' : action === 'remove' ? 'Removing…' : 'Restarting…', false);
+        btn.disabled = true;
+        await request('/api/commands/' + encodeURIComponent(subdomain) + '/' + action, {method: 'POST', body: '{}'});
+        if (action === 'remove') {
+          window.location.assign('/');
+          return;
+        }
+        setMsg('');
+      } catch (err) {
+        setMsg(err.message);
+        btn.disabled = false;
+      }
+    });
+
+    syncTitleAndScroll();
+  </script>
+</body>
+</html>

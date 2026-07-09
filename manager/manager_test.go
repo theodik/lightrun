@@ -407,7 +407,7 @@ func TestExpandBinaryPath(t *testing.T) {
 		{"~", "/h", "/h"},
 		{"~/foo", "/h", "/h/foo"},
 		{"~/a/b", "/h", "/h/a/b"},
-		{"~foo", "/h", "~foo"},       // ~user form: unsupported, passthrough
+		{"~foo", "/h", "~foo"},           // ~user form: unsupported, passthrough
 		{"/abs/path", "/h", "/abs/path"}, // absolute: untouched
 		{"rel/path", "/h", "rel/path"},   // relative: untouched
 		{"~/foo", "", "~/foo"},           // empty base: disabled
@@ -589,6 +589,87 @@ func TestStopAll(t *testing.T) {
 	for _, p := range m.List() {
 		if p.Status() != StatusStopped {
 			t.Errorf("process %s status = %s, want stopped", p.ID, p.Status())
+		}
+	}
+}
+
+func TestStart_RequiresExactlyOneLaunchMode(t *testing.T) {
+	bin := writeTestBin(t, "#!/bin/sh\nsleep 1\n")
+	m := New(10, 0, "")
+	t.Cleanup(func() { stopAll(t, m) })
+
+	cases := []struct {
+		name string
+		opts StartOptions
+	}{
+		{
+			name: "neither",
+			opts: StartOptions{Subdomain: "neither", Port: freePort(t), Gateway: "g"},
+		},
+		{
+			name: "both",
+			opts: StartOptions{BinaryPath: bin, Command: "echo hi", Subdomain: "both", Port: freePort(t), Gateway: "g"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := m.Start(tc.opts)
+			if err == nil || !strings.Contains(err.Error(), "exactly one") {
+				t.Fatalf("got %v, want exactly-one launch mode error", err)
+			}
+		})
+	}
+}
+
+func TestRunCommand_ConcurrentCallsAreIdempotent(t *testing.T) {
+	bin := writeTestBin(t, "#!/bin/sh\nsleep 30\n")
+	m := New(10, 0, "")
+	t.Cleanup(func() { stopAll(t, m) })
+
+	p, err := m.Start(StartOptions{
+		BinaryPath: bin,
+		Name:       "Concurrent",
+		Subdomain:  "concurrent",
+		Port:       freePort(t),
+		Gateway:    "g",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.StopInstance(p.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	ids := make(chan string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p, _, err := m.RunCommand("concurrent")
+			if err != nil {
+				errs <- err
+				return
+			}
+			ids <- p.ID
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	close(ids)
+	for err := range errs {
+		t.Fatalf("RunCommand returned error: %v", err)
+	}
+	var want string
+	for id := range ids {
+		if want == "" {
+			want = id
+			continue
+		}
+		if id != want {
+			t.Fatalf("RunCommand started multiple processes: got %q and %q", want, id)
 		}
 	}
 }

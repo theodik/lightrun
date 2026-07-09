@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,6 +63,25 @@ func (h Health) String() string {
 	return "unknown"
 }
 
+// EventKind identifies the change represented by a Manager event.
+type EventKind string
+
+const (
+	EventKindAdded    EventKind = "added"
+	EventKindUpdated  EventKind = "updated"
+	EventKindRemoved  EventKind = "removed"
+	EventKindLog      EventKind = "log"
+	EventKindRegistry EventKind = "registry"
+)
+
+// Event is emitted on process lifecycle and log changes.
+// Process is nil when Kind == EventKindRemoved; ID carries the process ID.
+type Event struct {
+	Kind    EventKind
+	Process *Process
+	ID      string // process ID for removed process events; subdomain for registry events
+}
+
 // Default probe timings; copied into each Manager at New(). Per-Manager fields
 // avoid cross-test races when tests want a shorter window. Don't mutate these
 // — set the corresponding Manager field on a freshly constructed instance.
@@ -71,13 +91,16 @@ const (
 )
 
 type Process struct {
-	ID         string
-	BinaryPath string
-	WorkingDir string
-	Subdomain  string
-	Port       int
-	Gateway    string
-	StartTime  time.Time
+	ID          string
+	BinaryPath  string
+	Command     string // shell command string if set, else empty
+	WorkingDir  string
+	Subdomain   string
+	Port        int
+	Gateway     string
+	StartTime   time.Time
+	Name        string
+	Description string
 
 	mu       sync.RWMutex
 	cmd      *exec.Cmd
@@ -113,17 +136,29 @@ func (p *Process) Tail(n int) []string {
 	return p.logs.tail(n)
 }
 
+// StartOptions is also the persisted unit: the JSON tags define the on-disk
+// state-file format the store reads back at boot, so renaming a field is a
+// format change. By the time an entry is remembered the paths have been
+// expanded and WorkingDir defaulted, so restored opts need no base dir to
+// resolve.
 type StartOptions struct {
-	BinaryPath string
-	Subdomain  string
-	Port       int
-	Env        map[string]string
-	Gateway    string
-	// WorkingDir is the directory the child process is launched in. Empty
-	// means "use the directory containing BinaryPath" — most apps expect to
-	// run from next to their own assets (web/, tmp/, ...), so that default
-	// matches typical run.sh behaviour.
-	WorkingDir string
+	BinaryPath string            `json:"binary_path,omitempty"`
+	Subdomain  string            `json:"subdomain"`
+	Port       int               `json:"port"`
+	Env        map[string]string `json:"env,omitempty"`
+	Gateway    string            `json:"gateway"`
+	// WorkingDir is the directory the child process is launched in. For
+	// binary_path mode, empty defaults to the directory containing the binary.
+	// For command mode, empty defaults to binaryBaseDir (lightrun's home).
+	WorkingDir string `json:"working_dir,omitempty"`
+	// Command is a shell command string (run via /bin/sh -c). Mutually
+	// exclusive with BinaryPath; one of the two must be non-empty.
+	Command string `json:"command,omitempty"`
+	// Name is an optional human label that makes this a registered command:
+	// it appears in the dashboard Commands section and persists in the command
+	// registry. Unnamed entries behave as before (ad-hoc processes).
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 type Manager struct {
@@ -131,6 +166,15 @@ type Manager struct {
 	procs       map[string]*Process
 	bySubdomain map[string]*Process
 	byPort      map[int]*Process
+	subs        []chan Event
+	subsMu      sync.RWMutex
+
+	// registry is the named command registry, keyed by subdomain. Named starts
+	// add or update entries; stopping a named process keeps its entry so it can
+	// be run again from the dashboard. Unnamed processes are ad-hoc and are not
+	// persisted.
+	registry map[string]StartOptions
+	store    StateStore
 
 	logSize       int
 	stoppedTTL    time.Duration
@@ -154,6 +198,7 @@ func New(logSize int, stoppedTTL time.Duration, binaryBaseDir string) *Manager {
 		procs:         make(map[string]*Process),
 		bySubdomain:   make(map[string]*Process),
 		byPort:        make(map[int]*Process),
+		registry:      make(map[string]StartOptions),
 		logSize:       logSize,
 		stoppedTTL:    stoppedTTL,
 		probeTimeout:  defaultProbeTimeout,
@@ -179,14 +224,51 @@ func (m *Manager) sweepStopped() {
 		return
 	}
 	cutoff := time.Now().Add(-m.stoppedTTL)
+	var removed []string
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	for id, p := range m.procs {
 		p.mu.RLock()
 		drop := p.status == StatusStopped && !p.stopTime.IsZero() && p.stopTime.Before(cutoff)
 		p.mu.RUnlock()
 		if drop {
+			removed = append(removed, id)
 			delete(m.procs, id)
+		}
+	}
+	m.mu.Unlock()
+	for _, id := range removed {
+		m.broadcast(Event{Kind: EventKindRemoved, ID: id})
+	}
+}
+
+// Subscribe registers a Manager event subscriber. The returned unsubscribe
+// function must be called by the receiver when it stops reading.
+func (m *Manager) Subscribe() (<-chan Event, func()) {
+	ch := make(chan Event, 64)
+	m.subsMu.Lock()
+	m.subs = append(m.subs, ch)
+	m.subsMu.Unlock()
+
+	return ch, func() {
+		m.subsMu.Lock()
+		for i, sub := range m.subs {
+			if sub == ch {
+				m.subs = append(m.subs[:i], m.subs[i+1:]...)
+				break
+			}
+		}
+		m.subsMu.Unlock()
+		close(ch)
+	}
+}
+
+func (m *Manager) broadcast(e Event) {
+	m.subsMu.RLock()
+	defer m.subsMu.RUnlock()
+	for _, ch := range m.subs {
+		select {
+		case ch <- e:
+		default:
 		}
 	}
 }
@@ -199,22 +281,48 @@ var subdomainRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 var childEnvDenyPrefixes = []string{"LIGHTRUN_"}
 
 func (m *Manager) Start(opts StartOptions) (*Process, error) {
+	return m.start(opts, true)
+}
+
+// start launches a process. record controls whether the post-expansion opts
+// are remembered in the registry: true for caller-driven named starts, false
+// for RunCommand/Restore paths where the registry entry already exists.
+func (m *Manager) start(opts StartOptions, record bool) (*Process, error) {
 	if !subdomainRe.MatchString(opts.Subdomain) {
 		return nil, fmt.Errorf("invalid subdomain %q", opts.Subdomain)
 	}
 	if opts.Port <= 0 || opts.Port > 65535 {
 		return nil, fmt.Errorf("invalid port %d", opts.Port)
 	}
-	opts.BinaryPath = expandBinaryPath(opts.BinaryPath, m.binaryBaseDir)
-	if err := checkBinary(opts.BinaryPath); err != nil {
-		return nil, err
+	opts.BinaryPath = strings.TrimSpace(opts.BinaryPath)
+	opts.Command = strings.TrimSpace(opts.Command)
+	if (opts.Command == "") == (opts.BinaryPath == "") {
+		return nil, fmt.Errorf("exactly one of binary_path or command must be provided")
 	}
-	if opts.WorkingDir == "" {
-		opts.WorkingDir = filepath.Dir(opts.BinaryPath)
-	} else {
-		opts.WorkingDir = expandBinaryPath(opts.WorkingDir, m.binaryBaseDir)
-		if err := checkWorkingDir(opts.WorkingDir); err != nil {
+	if opts.Command != "" {
+		// Shell command mode: run via /bin/sh -c. No binary check needed.
+		if opts.WorkingDir == "" {
+			if m.binaryBaseDir != "" {
+				opts.WorkingDir = m.binaryBaseDir
+			}
+		} else {
+			opts.WorkingDir = expandBinaryPath(opts.WorkingDir, m.binaryBaseDir)
+			if err := checkWorkingDir(opts.WorkingDir); err != nil {
+				return nil, err
+			}
+		}
+	} else if opts.BinaryPath != "" {
+		opts.BinaryPath = expandBinaryPath(opts.BinaryPath, m.binaryBaseDir)
+		if err := checkBinary(opts.BinaryPath); err != nil {
 			return nil, err
+		}
+		if opts.WorkingDir == "" {
+			opts.WorkingDir = filepath.Dir(opts.BinaryPath)
+		} else {
+			opts.WorkingDir = expandBinaryPath(opts.WorkingDir, m.binaryBaseDir)
+			if err := checkWorkingDir(opts.WorkingDir); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -238,20 +346,28 @@ func (m *Manager) Start(opts StartOptions) (*Process, error) {
 	}
 
 	p := &Process{
-		ID:         id,
-		BinaryPath: opts.BinaryPath,
-		WorkingDir: opts.WorkingDir,
-		Subdomain:  opts.Subdomain,
-		Port:       opts.Port,
-		Gateway:    opts.Gateway,
-		StartTime:  time.Now(),
-		status:     StatusRunning,
-		logs:       newRingBuffer(m.logSize),
-		done:       make(chan struct{}),
-		opts:       opts,
+		ID:          id,
+		BinaryPath:  opts.BinaryPath,
+		Command:     opts.Command,
+		WorkingDir:  opts.WorkingDir,
+		Subdomain:   opts.Subdomain,
+		Port:        opts.Port,
+		Gateway:     opts.Gateway,
+		StartTime:   time.Now(),
+		Name:        opts.Name,
+		Description: opts.Description,
+		status:      StatusRunning,
+		logs:        newRingBuffer(m.logSize),
+		done:        make(chan struct{}),
+		opts:        opts,
 	}
 
-	cmd := exec.Command(opts.BinaryPath)
+	var cmd *exec.Cmd
+	if opts.Command != "" {
+		cmd = exec.Command("/bin/sh", "-c", opts.Command)
+	} else {
+		cmd = exec.Command(opts.BinaryPath)
+	}
 	cmd.Dir = opts.WorkingDir
 	cmd.Env = buildChildEnv(opts.Port, opts.Env)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -280,11 +396,19 @@ func (m *Manager) Start(opts StartOptions) (*Process, error) {
 	m.bySubdomain[opts.Subdomain] = p
 	m.byPort[opts.Port] = p
 	m.mu.Unlock()
+	m.broadcast(Event{Kind: EventKindAdded, Process: p})
+
+	if record && opts.Name != "" {
+		m.remember(opts)
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go pipeIntoBuffer(stdout, p.logs, &wg)
-	go pipeIntoBuffer(stderr, p.logs, &wg)
+	logUpdated := func() {
+		m.broadcast(Event{Kind: EventKindLog, Process: p})
+	}
+	go pipeIntoBuffer(stdout, p.logs, &wg, logUpdated)
+	go pipeIntoBuffer(stderr, p.logs, &wg, logUpdated)
 
 	go m.reap(p, &wg)
 	go m.probeHealth(p)
@@ -320,6 +444,7 @@ func (m *Manager) probeHealth(p *Process) {
 		p.mu.Lock()
 		p.health = HealthHealthy
 		p.mu.Unlock()
+		m.broadcast(Event{Kind: EventKindUpdated, Process: p})
 		return
 	}
 
@@ -331,6 +456,9 @@ func (m *Manager) probeHealth(p *Process) {
 			p.mu.Lock()
 			if p.status == StatusRunning {
 				p.health = HealthUnhealthy
+				p.mu.Unlock()
+				m.broadcast(Event{Kind: EventKindUpdated, Process: p})
+				return
 			}
 			p.mu.Unlock()
 			return
@@ -339,6 +467,7 @@ func (m *Manager) probeHealth(p *Process) {
 				p.mu.Lock()
 				p.health = HealthHealthy
 				p.mu.Unlock()
+				m.broadcast(Event{Kind: EventKindUpdated, Process: p})
 				return
 			}
 		}
@@ -367,9 +496,24 @@ func (m *Manager) reap(p *Process, wg *sync.WaitGroup) {
 		delete(m.byPort, p.Port)
 	}
 	m.mu.Unlock()
+	m.broadcast(Event{Kind: EventKindUpdated, Process: p})
 }
 
+// Stop terminates a process. Ad-hoc process stops remove any stale registry
+// entry; named command stops keep the registration so the command remains
+// available on the dashboard. Internal callers that should never change
+// registry state call stop directly.
 func (m *Manager) Stop(id string) error {
+	m.mu.RLock()
+	p, ok := m.procs[id]
+	m.mu.RUnlock()
+	if ok && p.Name == "" {
+		m.forget(p.Subdomain)
+	}
+	return m.stop(id)
+}
+
+func (m *Manager) stop(id string) error {
 	m.mu.RLock()
 	p, ok := m.procs[id]
 	m.mu.RUnlock()
@@ -413,7 +557,7 @@ func (m *Manager) Restart(id string) (*Process, error) {
 		return nil, fmt.Errorf("process %q not found", id)
 	}
 	if old.Status() == StatusRunning {
-		if err := m.Stop(id); err != nil {
+		if err := m.stop(id); err != nil {
 			return nil, fmt.Errorf("stop before restart: %w", err)
 		}
 	}
@@ -459,6 +603,106 @@ func (m *Manager) List() []*Process {
 	return out
 }
 
+// LatestBySubdomain returns the running process for subdomain if present,
+// otherwise the most recently started stopped process for that subdomain.
+func (m *Manager) LatestBySubdomain(subdomain string) (*Process, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if p, ok := m.bySubdomain[subdomain]; ok && p.Status() == StatusRunning {
+		return p, true
+	}
+	var latest *Process
+	for _, p := range m.procs {
+		if p.Subdomain != subdomain {
+			continue
+		}
+		if latest == nil || p.StartTime.After(latest.StartTime) {
+			latest = p
+		}
+	}
+	return latest, latest != nil
+}
+
+// RunCommand starts the command registered for subdomain. If a process is
+// already running on that subdomain, it returns it with alreadyRunning=true
+// (no-op). Returns an error if the subdomain has no registered command.
+func (m *Manager) RunCommand(subdomain string) (p *Process, alreadyRunning bool, err error) {
+	m.mu.RLock()
+	existing, ok := m.bySubdomain[subdomain]
+	m.mu.RUnlock()
+	if ok && existing.Status() == StatusRunning {
+		return existing, true, nil
+	}
+
+	m.mu.RLock()
+	opts, ok := m.registry[subdomain]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, false, fmt.Errorf("no registered command for subdomain %q", subdomain)
+	}
+	p, err = m.start(opts, false)
+	if err != nil {
+		m.mu.RLock()
+		existing, ok := m.bySubdomain[subdomain]
+		m.mu.RUnlock()
+		if ok && existing.Status() == StatusRunning {
+			return existing, true, nil
+		}
+	}
+	return p, false, err
+}
+
+// StopInstance stops the process by id without removing it from the registry
+// so a named command can be run again from the dashboard.
+func (m *Manager) StopInstance(id string) error {
+	return m.stop(id)
+}
+
+// UnregisterCommand removes a named command from the registry. If the command
+// is currently running, its process is stopped first.
+func (m *Manager) UnregisterCommand(subdomain string) error {
+	if _, ok := m.GetDesired(subdomain); !ok {
+		return fmt.Errorf("no registered command for subdomain %q", subdomain)
+	}
+	if p, ok := m.GetBySubdomain(subdomain); ok && p.Status() == StatusRunning {
+		if err := m.stop(p.ID); err != nil {
+			return err
+		}
+	}
+	m.forget(subdomain)
+	return nil
+}
+
+// ListDesired returns registered commands, sorted by Name then Subdomain.
+func (m *Manager) ListDesired() []StartOptions {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]StartOptions, 0, len(m.registry))
+	for _, opts := range m.registry {
+		out = append(out, opts)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ni := out[i].Name
+		if ni == "" {
+			ni = out[i].Subdomain
+		}
+		nj := out[j].Name
+		if nj == "" {
+			nj = out[j].Subdomain
+		}
+		return ni < nj
+	})
+	return out
+}
+
+// GetDesired returns the registered command for a subdomain, if one exists.
+func (m *Manager) GetDesired(subdomain string) (StartOptions, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	opts, ok := m.registry[subdomain]
+	return opts, ok
+}
+
 func (m *Manager) StopAll(ctx context.Context) {
 	m.mu.RLock()
 	ids := make([]string, 0, len(m.procs))
@@ -474,7 +718,7 @@ func (m *Manager) StopAll(ctx context.Context) {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			_ = m.Stop(id)
+			_ = m.stop(id)
 		}(id)
 	}
 
@@ -619,12 +863,15 @@ func hasAnyPrefix(s string, prefixes []string) bool {
 	return false
 }
 
-func pipeIntoBuffer(r io.Reader, buf *ringBuffer, wg *sync.WaitGroup) {
+func pipeIntoBuffer(r io.Reader, buf *ringBuffer, wg *sync.WaitGroup, onLine func()) {
 	defer wg.Done()
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		buf.add(scanner.Text())
+		if onLine != nil {
+			onLine()
+		}
 	}
 }
 

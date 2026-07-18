@@ -127,13 +127,13 @@
             <input name="subdomain" autocomplete="off" required placeholder="app1">
           </label>
           <label>
-            Port
-            <input name="port" type="number" min="1" max="65535" required placeholder="3000">
+            Port <small style="color:#8a9e99;font-weight:normal">(optional)</small>
+            <input name="port" type="number" min="1" max="65535" placeholder="3000">
           </label>
         </div>
         <label>
-          Gateway
-          <select name="gateway" id="gateway-select" required></select>
+          Gateway <small style="color:#8a9e99;font-weight:normal">(optional — leave blank if this command doesn't listen on a port)</small>
+          <select name="gateway" id="gateway-select"></select>
         </label>
         <label>
           Env JSON <small style="color:#8a9e99;font-weight:normal">(optional)</small>
@@ -173,7 +173,10 @@
     async function loadGateways() {
       const data = await request('/api/gateways');
       const select = document.querySelector('#gateway-select');
-      select.replaceChildren(...data.gateways.map((gateway) => {
+      const noneOption = document.createElement('option');
+      noneOption.value = '';
+      noneOption.textContent = '— none —';
+      select.replaceChildren(noneOption, ...data.gateways.map((gateway) => {
         const option = document.createElement('option');
         option.value = gateway.name;
         option.textContent = gateway.description ? `${gateway.name} — ${gateway.description}` : gateway.name;

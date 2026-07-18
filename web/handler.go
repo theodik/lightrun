@@ -621,8 +621,8 @@ const fullUpdateTmpl = `<div id="command-list">
 {{- range .Processes}}
 <tr id="proc-{{.ID}}">
   <td><strong>{{.Subdomain}}</strong><br><small>{{.ID}}</small></td>
-  <td>{{.Gateway}}</td>
-  <td>{{.Port}}</td>
+  <td>{{if .Gateway}}{{.Gateway}}{{else}}-{{end}}</td>
+  <td>{{if .Port}}{{.Port}}{{else}}-{{end}}</td>
   <td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>
   <td><span class="badge badge-{{.Health}}">{{.Health}}</span></td>
   <td>{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noreferrer">open</a>{{else}}-{{end}}</td>

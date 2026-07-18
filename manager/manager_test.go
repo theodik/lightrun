@@ -169,6 +169,33 @@ func TestStart_LooksUpBySubdomain(t *testing.T) {
 	}
 }
 
+func TestStart_NoPortIsOptional(t *testing.T) {
+	bin := writeTestBin(t, "#!/bin/sh\nsleep 30\n")
+	m := New(10, 0, "")
+	t.Cleanup(func() { stopAll(t, m) })
+
+	p1, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "noport1", Port: 0, Gateway: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1.Port != 0 {
+		t.Errorf("port = %d, want 0", p1.Port)
+	}
+	if p1.Health() != HealthNone {
+		t.Errorf("health = %s, want %s (running)", p1.Health(), HealthNone)
+	}
+
+	// A second portless process must not spuriously collide via a shared
+	// "port 0" registry entry.
+	p2, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "noport2", Port: 0, Gateway: ""})
+	if err != nil {
+		t.Fatalf("second portless start: %v", err)
+	}
+	if p2.Health() != HealthNone {
+		t.Errorf("health = %s, want %s (running)", p2.Health(), HealthNone)
+	}
+}
+
 func TestStart_ValidationErrors(t *testing.T) {
 	m := New(10, 0, "")
 	t.Cleanup(func() { stopAll(t, m) })
@@ -183,7 +210,7 @@ func TestStart_ValidationErrors(t *testing.T) {
 
 	t.Run("invalid port", func(t *testing.T) {
 		bin := writeTestBin(t, "#!/bin/sh\nsleep 1\n")
-		_, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "ok", Port: 0, Gateway: "g"})
+		_, err := m.Start(StartOptions{BinaryPath: bin, Subdomain: "ok", Port: 70000, Gateway: "g"})
 		if err == nil || !strings.Contains(err.Error(), "invalid port") {
 			t.Errorf("got %v, want invalid-port error", err)
 		}

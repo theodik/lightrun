@@ -43,12 +43,17 @@ func (s Status) String() string {
 // health value it last had (e.g. "starting" if it exited before the probe
 // reached a verdict). The two fields together let callers distinguish "running
 // and serving" from "running but bound to a different port / not bound yet".
+//
+// A process started with no declared port (Port == 0) has nothing to probe —
+// same as a Docker container with no healthcheck defined — so it's reported
+// as HealthNone ("running") instead of cycling through starting/unhealthy.
 type Health int
 
 const (
 	HealthStarting  Health = iota // process up, probe still in its window
 	HealthHealthy                 // probe successfully connected to declared port
 	HealthUnhealthy               // probe window elapsed without a successful connect
+	HealthNone                    // no port declared; nothing to probe
 )
 
 func (h Health) String() string {
@@ -59,6 +64,8 @@ func (h Health) String() string {
 		return "healthy"
 	case HealthUnhealthy:
 		return "unhealthy"
+	case HealthNone:
+		return "running"
 	}
 	return "unknown"
 }
@@ -291,7 +298,7 @@ func (m *Manager) start(opts StartOptions, record bool) (*Process, error) {
 	if !subdomainRe.MatchString(opts.Subdomain) {
 		return nil, fmt.Errorf("invalid subdomain %q", opts.Subdomain)
 	}
-	if opts.Port <= 0 || opts.Port > 65535 {
+	if opts.Port < 0 || opts.Port > 65535 {
 		return nil, fmt.Errorf("invalid port %d", opts.Port)
 	}
 	opts.BinaryPath = strings.TrimSpace(opts.BinaryPath)
@@ -331,13 +338,15 @@ func (m *Manager) start(opts StartOptions, record bool) (*Process, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("subdomain %q already in use by process %s", opts.Subdomain, existing.ID)
 	}
-	if existing, ok := m.byPort[opts.Port]; ok && existing.Status() == StatusRunning {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("port %d already in use by process %s (subdomain %q)", opts.Port, existing.ID, existing.Subdomain)
-	}
-	if !portFree(opts.Port) {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("port %d is already bound by another process on the host", opts.Port)
+	if opts.Port != 0 {
+		if existing, ok := m.byPort[opts.Port]; ok && existing.Status() == StatusRunning {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("port %d already in use by process %s (subdomain %q)", opts.Port, existing.ID, existing.Subdomain)
+		}
+		if !portFree(opts.Port) {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("port %d is already bound by another process on the host", opts.Port)
+		}
 	}
 	id, err := m.newIDLocked()
 	if err != nil {
@@ -360,6 +369,9 @@ func (m *Manager) start(opts StartOptions, record bool) (*Process, error) {
 		logs:        newRingBuffer(m.logSize),
 		done:        make(chan struct{}),
 		opts:        opts,
+	}
+	if opts.Port == 0 {
+		p.health = HealthNone
 	}
 
 	var cmd *exec.Cmd
@@ -394,7 +406,9 @@ func (m *Manager) start(opts StartOptions, record bool) (*Process, error) {
 
 	m.procs[id] = p
 	m.bySubdomain[opts.Subdomain] = p
-	m.byPort[opts.Port] = p
+	if opts.Port != 0 {
+		m.byPort[opts.Port] = p
+	}
 	m.mu.Unlock()
 	m.broadcast(Event{Kind: EventKindAdded, Process: p})
 
@@ -411,7 +425,9 @@ func (m *Manager) start(opts StartOptions, record bool) (*Process, error) {
 	go pipeIntoBuffer(stderr, p.logs, &wg, logUpdated)
 
 	go m.reap(p, &wg)
-	go m.probeHealth(p)
+	if opts.Port != 0 {
+		go m.probeHealth(p)
+	}
 
 	return p, nil
 }
@@ -847,7 +863,9 @@ func buildChildEnv(port int, extra map[string]string) []string {
 		}
 		env = append(env, kv)
 	}
-	env = append(env, "PORT="+strconv.Itoa(port))
+	if port != 0 {
+		env = append(env, "PORT="+strconv.Itoa(port))
+	}
 	for k, v := range extra {
 		env = append(env, k+"="+v)
 	}

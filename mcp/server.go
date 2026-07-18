@@ -113,7 +113,7 @@ func (s *Server) gatewayNames() []string {
 
 func (s *Server) startToolDescription() string {
 	var b strings.Builder
-	b.WriteString("Start a managed app process. The caller declares the 'port' the app will listen on; lightrun routes the gateway listener to 127.0.0.1:<port> for the given subdomain. The 'gateway' parameter selects which named listener to register against. Each gateway corresponds to a Traefik router with its own middleware chain (auth, public, etc.) — lightrun does not enforce auth itself. The process inherits lightrun's environment (minus LIGHTRUN_* config vars), with PORT=<port> set as a convenience hint and any additional env vars supplied layered on top — if the caller sets PORT in env it overrides the hint (env is passed through verbatim). The app is expected to listen on the declared port; lightrun probes 127.0.0.1:<port> for ~5s after start and reports a 'health' field via the status tool: 'starting' (probe in progress), 'healthy' (connect succeeded), 'unhealthy' (window elapsed without a successful connect — typically means the app bound a different port).\n\nAvailable gateways:\n")
+	b.WriteString("Start a managed app process. Both 'port' and 'gateway' are optional — omit them for a process that doesn't listen on a network port (e.g. a one-off script or worker). When 'port' is given, lightrun routes the 'gateway' listener to 127.0.0.1:<port> for the given subdomain, exposes PORT=<port> as a convenience hint in the child env, and probes 127.0.0.1:<port> for ~5s after start, reporting a 'health' field via the status tool: 'starting' (probe in progress), 'healthy' (connect succeeded), 'unhealthy' (window elapsed without a successful connect — typically means the app bound a different port). When 'port' is omitted, health is reported as 'running' instead (nothing to probe, same as a Docker container with no healthcheck). Any additional env vars supplied are layered on top of lightrun's own environment (minus LIGHTRUN_* config vars) — if the caller sets PORT in env it overrides the hint (env is passed through verbatim). The 'gateway' parameter selects which named listener to register against; each gateway corresponds to a Traefik router with its own middleware chain (auth, public, etc.) — lightrun does not enforce auth itself.\n\nAvailable gateways:\n")
 	for _, g := range s.gateways {
 		fmt.Fprintf(&b, "  - %s", g.Name)
 		if g.Description != "" {
@@ -148,13 +148,11 @@ func (s *Server) registerTools() {
 				mcpgo.Description("DNS-label-safe subdomain prefix the process will be reachable at. Some gateways restrict this to a fixed allowlist — call the 'gateways' tool to see each gateway's 'subdomain_policy'. When 'subdomain_policy' is 'allowlist', pick a free entry (in_use=false) from that gateway's 'subdomains'; when 'any', you may pick any DNS-safe label."),
 			),
 			mcpgo.WithNumber("port",
-				mcpgo.Required(),
-				mcpgo.Description("Port (1-65535) the app will listen on. Lightrun routes the gateway to 127.0.0.1:<port> and also exposes it as PORT in the child env."),
+				mcpgo.Description("Optional. Port (1-65535) the app will listen on. Lightrun routes the gateway to 127.0.0.1:<port> and also exposes it as PORT in the child env. Omit if the app doesn't listen on a network port — health will report as 'running' instead of starting/healthy/unhealthy."),
 			),
 			mcpgo.WithString("gateway",
-				mcpgo.Required(),
 				mcpgo.Enum(names...),
-				mcpgo.Description("Which gateway to register against. One of: "+strings.Join(names, ", ")),
+				mcpgo.Description("Optional. Which gateway to register against. One of: "+strings.Join(names, ", ")+". Omit if the process isn't reachable via a gateway."),
 			),
 			mcpgo.WithObject("env",
 				mcpgo.Description("Optional map of additional environment variables (string -> string)."),
@@ -302,36 +300,34 @@ func (s *Server) handleStart(_ context.Context, req mcpgo.CallToolRequest) (*mcp
 	name, _ := args["name"].(string)
 	description, _ := args["description"].(string)
 
-	portRaw, ok := args["port"]
-	if !ok {
-		return mcpgo.NewToolResultError("port is required"), nil
-	}
-	portF, ok := portRaw.(float64)
-	if !ok {
-		return mcpgo.NewToolResultError("port must be a number"), nil
-	}
-	port := int(portF)
-	if float64(port) != portF || port <= 0 || port > 65535 {
-		return mcpgo.NewToolResultError(fmt.Sprintf("port must be an integer in 1-65535, got %v", portRaw)), nil
+	port := 0
+	if portRaw, ok := args["port"]; ok {
+		portF, ok := portRaw.(float64)
+		if !ok {
+			return mcpgo.NewToolResultError("port must be a number"), nil
+		}
+		port = int(portF)
+		if float64(port) != portF || port < 0 || port > 65535 {
+			return mcpgo.NewToolResultError(fmt.Sprintf("port must be an integer in 0-65535, got %v", portRaw)), nil
+		}
 	}
 
-	if gateway == "" {
-		return mcpgo.NewToolResultError("gateway is required"), nil
-	}
-	gw, ok := s.gwIndex[gateway]
-	if !ok {
-		return mcpgo.NewToolResultError(fmt.Sprintf("unknown gateway %q; valid: %s", gateway, strings.Join(s.gatewayNames(), ", "))), nil
-	}
-	if len(gw.Subdomains) > 0 {
-		allowed := false
-		for _, sub := range gw.Subdomains {
-			if sub == subdomain {
-				allowed = true
-				break
-			}
+	if gateway != "" {
+		gw, ok := s.gwIndex[gateway]
+		if !ok {
+			return mcpgo.NewToolResultError(fmt.Sprintf("unknown gateway %q; valid: %s", gateway, strings.Join(s.gatewayNames(), ", "))), nil
 		}
-		if !allowed {
-			return mcpgo.NewToolResultError(fmt.Sprintf("subdomain %q not in allowlist for gateway %q; allowed: %s", subdomain, gateway, strings.Join(gw.Subdomains, ", "))), nil
+		if len(gw.Subdomains) > 0 {
+			allowed := false
+			for _, sub := range gw.Subdomains {
+				if sub == subdomain {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return mcpgo.NewToolResultError(fmt.Sprintf("subdomain %q not in allowlist for gateway %q; allowed: %s", subdomain, gateway, strings.Join(gw.Subdomains, ", "))), nil
+			}
 		}
 	}
 

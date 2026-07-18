@@ -143,10 +143,14 @@ func TestStartTool_Schema(t *testing.T) {
 	for _, r := range schema.Required {
 		required[r] = true
 	}
-	// binary_path and command are optional (either-or); only these three are required.
-	for _, name := range []string{"subdomain", "port", "gateway"} {
-		if !required[name] {
-			t.Errorf("expected %q to be required, got Required=%v", name, schema.Required)
+	// binary_path/command are optional (either-or); port/gateway are optional
+	// (a process may not listen on a network port); only subdomain is required.
+	if !required["subdomain"] {
+		t.Errorf("expected %q to be required, got Required=%v", "subdomain", schema.Required)
+	}
+	for _, name := range []string{"port", "gateway"} {
+		if required[name] {
+			t.Errorf("expected %q to be optional, got Required=%v", name, schema.Required)
 		}
 	}
 	if _, ok := schema.Properties["env"]; !ok {
@@ -181,11 +185,10 @@ func TestHandleStart_PortValidation(t *testing.T) {
 		args map[string]any
 		want string
 	}{
-		{"missing", base(), "port is required"},
 		{"non-number", merge(base(), "port", "8080"), "port must be a number"},
-		{"fractional", merge(base(), "port", 8080.5), "integer in 1-65535"},
-		{"zero", merge(base(), "port", float64(0)), "integer in 1-65535"},
-		{"out of range", merge(base(), "port", float64(70000)), "integer in 1-65535"},
+		{"fractional", merge(base(), "port", 8080.5), "integer in 0-65535"},
+		{"negative", merge(base(), "port", float64(-1)), "integer in 0-65535"},
+		{"out of range", merge(base(), "port", float64(70000)), "integer in 0-65535"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -256,6 +259,34 @@ func TestHandleStart_GatewayValidation(t *testing.T) {
 	}
 	if !res.IsError || !strings.Contains(resultText(t, res), "unknown gateway") {
 		t.Errorf("expected unknown-gateway error, got %q", resultText(t, res))
+	}
+}
+
+func TestHandleStart_NoPortNoGateway(t *testing.T) {
+	s := newTestServer(t)
+	bin := writeSleepBin(t)
+
+	res, err := s.handleStart(context.Background(), callTool(map[string]any{
+		"binary_path": bin, "subdomain": "portless",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	var view processView
+	if err := json.Unmarshal([]byte(resultText(t, res)), &view); err != nil {
+		t.Fatalf("could not parse view JSON: %v\n%s", err, resultText(t, res))
+	}
+	if view.Port != 0 {
+		t.Errorf("Port = %d, want 0", view.Port)
+	}
+	if view.Gateway != "" {
+		t.Errorf("Gateway = %q, want empty", view.Gateway)
+	}
+	if view.Health != "running" {
+		t.Errorf("Health = %q, want %q", view.Health, "running")
 	}
 }
 
